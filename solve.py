@@ -8,6 +8,7 @@ import blackjax
 import distrax
 from flax import nnx
 import einops
+from functools import partial
 
 @jax.tree_util.register_dataclass
 @dataclass
@@ -21,13 +22,20 @@ class Nucleus:
     position: Array
     charge: Array
 
-def hamiltonian(nuclei: Nucleus):
+def hamiltonian(nuclei: Nucleus, wave_function: nnx.Module):
     nuclea_i, nuclea_j = jnp.triu_indices(nuclei.position.shape[0], k=1)
     nuclei_charge = nuclei.charge[nuclea_i] * nuclei.charge[nuclea_j]
     nuclei_distances = jnp.linalg.norm(nuclei.position[nuclea_i] - nuclei.position[nuclea_j], axis=-1)
     nuclea_interaction = jnp.sum(nuclei_charge / nuclei_distances)
 
-    def _inner(electrons: Electron, wave_function) -> Array:
+    @jax.jit
+    def call_wavefunction_wrapper(graphdef: nnx.GraphDef, state: nnx.State, electrons: Electron) -> Array:
+        model = nnx.merge(graphdef, state)
+        return model(electrons)
+    graphdef, state = nnx.split(wave_function)
+
+    @jax.jit
+    def _inner(electrons: Electron) -> Array:
         electron_i, electron_j = jnp.triu_indices(electrons.position.shape[0], k=1)
         electron_distances = jnp.linalg.norm(electrons.position[electron_i] - electrons.position[electron_j], axis=-1)
         electron_repulsion = 1/jnp.sum(electron_distances)
@@ -37,7 +45,7 @@ def hamiltonian(nuclei: Nucleus):
         )
         nucleus_electron_interaction = -jnp.sum(nuclei.charge[None, :] / electron_nuclei_distances)
 
-        laplacian = forward_laplacian(wave_function)(electrons)
+        laplacian = forward_laplacian(call_wavefunction_wrapper)(graphdef, state, electrons)
         laplacian = -0.5 * jnp.sum(laplacian.laplacian)
 
         return laplacian + electron_repulsion + nucleus_electron_interaction + nuclea_interaction
@@ -52,17 +60,6 @@ electron_positions = jnp.array([[0.5, 0.5, 0.5], [1.5, 1.5, 1.5]], dtype=jnp.flo
 electron_spins = jnp.array([[1.0], [-1.0]], dtype=jnp.float32)
 electrons = Electron(position=electron_positions, spin=electron_spins)
 
-mu = jnp.array([-1., 0., 1.])
-sigma = jnp.array([0.1, 0.2, 0.3])
-dist_distrax = distrax.MultivariateNormalDiag(mu, sigma)
-
-# def wave_function(electrons: Electron) -> Array:
-#     # A simple wave function, for example, a Gaussian
-#     # return jnp.exp(-jnp.sum(electrons.position**2, axis=-1))
-#     print("Computing wave function for electrons:", electrons)
-#     prob = dist_distrax.log_prob(electrons.position)
-#     # print("Got prob: ", prob)
-#     return prob
 
 # The following constructs a wave function using a neural network, following the
 # terminology described by https://en.wikipedia.org/wiki/Slater_determinant#Multi-particle_case
@@ -99,16 +96,16 @@ class SlaterDeterminant(nnx.Module):
         self.chis = create_chis(rngs)
 
     def __call__(self, electrons: Electron) -> Array:
-        @nnx.vmap
-        def calc_chis(chi: Chi) -> Array:
+        @nnx.vmap(in_axes=(0, None), out_axes=0)
+        def calc_chis(chi: Chi, electrons: Electron) -> Array:
             @nnx.vmap
             def _inner(electrons: Electron) -> Array:
-                print("Calculating chi for electron:", electrons)
                 return chi(electrons)
             return _inner(electrons)
 
-        print(f"Chis: {self.chis}")
-        determinant = jnp.linalg.det(calc_chis(self.chis)(electrons))
+        chi_matrix = calc_chis(self.chis, electrons)
+        print(f"Chi matrix shape: {chi_matrix.shape}")
+        determinant = jnp.linalg.det(chi_matrix)
         return determinant
 
 
@@ -119,17 +116,19 @@ class WaveFunction(nnx.Module):
         self.jastrow_strength = nnx.Param(jnp.array(-0.01))
 
     def __call__(self, electrons: Electron) -> Array:
-        # Exponential fall-off Jastrow factor
-        # TODO: Tweak this?
-        jastrow = jnp.exp(self.jastrow_strength * jnp.sum(electrons.position**2, axis=-1))
-        print("Jastrow factor:", jastrow)
-        return jastrow * self.slater_determinant(electrons)
+        # TODO: Add a Jastrow factor
+        return self.slater_determinant(electrons)
 
 wave_function = WaveFunction(num_electrons=electrons.position.shape[0], rngs=nnx.Rngs(jax.random.key(0)))
-h = hamiltonian(nuclei)(electrons, wave_function)
-print(h)
 
-hamiltonian_fixed_nuclei = hamiltonian(nuclei)
+wave_function = WaveFunction(num_electrons=electrons.position.shape[0], rngs=nnx.Rngs(jax.random.key(0)))
+direct_wave_func_eval = wave_function(electrons)
+print(f"Direct wave function evaluation: {direct_wave_func_eval}")
+
+h = hamiltonian(nuclei, wave_function)(electrons)
+print(f"Hamiltonian: {h}")
+
+hamiltonian_fixed_nuclei_and_wave = hamiltonian(nuclei, wave_function)
 
 
 def walk_electrons(sigma: Array) -> Callable:
@@ -145,7 +144,17 @@ sigma = 0.2
 
 @nnx.jit(static_argnames=["num_chains", "num_samples"])
 def sample_from_wavefunction(wave_function: WaveFunction, num_chains: int, num_samples: int, key: Key) -> ArrayLike:
-    random_walk = blackjax.additive_step_random_walk(wave_function, walk_electrons(sigma))
+    @jax.jit
+    def call_wavefunction_wrapper(electrons: Electron, graphdef: nnx.GraphDef, state: nnx.State) -> Array:
+        model = nnx.merge(graphdef, state)
+        res = model(electrons)
+        print(f"Wave function output shape: {res.shape}")
+        return res
+    graphdef, state = nnx.split(wave_function)
+    random_walk = blackjax.additive_step_random_walk(
+        partial(call_wavefunction_wrapper, graphdef=graphdef, state=state),
+        walk_electrons(sigma)
+    )
 
     chain_state = jax.vmap(random_walk.init, axis_size=num_chains, in_axes=None)(electrons)
     # chain_state = random_walk.init(electrons)
