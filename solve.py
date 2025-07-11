@@ -9,6 +9,7 @@ import distrax
 from flax import nnx
 import einops
 from functools import partial
+import plotly.graph_objects as go
 
 @jax.tree_util.register_dataclass
 @dataclass
@@ -36,9 +37,11 @@ def hamiltonian(nuclei: Nucleus, wave_function: nnx.Module):
 
     @jax.jit
     def _inner(electrons: Electron) -> Array:
-        electron_i, electron_j = jnp.triu_indices(electrons.position.shape[0], k=1)
-        electron_distances = jnp.linalg.norm(electrons.position[electron_i] - electrons.position[electron_j], axis=-1)
-        electron_repulsion = 1/jnp.sum(electron_distances)
+        electron_repulsion = 0.0
+        if electrons.position.shape[0] > 1:
+            electron_i, electron_j = jnp.triu_indices(electrons.position.shape[0], k=1)
+            electron_distances = jnp.linalg.norm(electrons.position[electron_i] - electrons.position[electron_j], axis=-1)
+            electron_repulsion = 1/jnp.sum(electron_distances)
 
         electron_nuclei_distances = jnp.linalg.norm(
             electrons.position[:, None] - nuclei.position[None, :], axis=-1
@@ -48,16 +51,22 @@ def hamiltonian(nuclei: Nucleus, wave_function: nnx.Module):
         laplacian = forward_laplacian(call_wavefunction_wrapper)(graphdef, state, electrons)
         laplacian = -0.5 * jnp.sum(laplacian.laplacian)
 
+        # jax.debug.print("Laplacian: {laplacian}, Electron repulsion: {electron_repulsion}, nucleus-electron interaction: {nucleus_electron_interaction}, nucleus-nucleus interaction: {nuclea_interaction}",
+        #                 laplacian=laplacian, electron_repulsion=electron_repulsion,
+        #                 nucleus_electron_interaction=nucleus_electron_interaction,
+        #                 nuclea_interaction=nuclea_interaction)
         return laplacian + electron_repulsion + nucleus_electron_interaction + nuclea_interaction
     return _inner
 
 
-nuclei_positions = jnp.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [2.0, 2.0, 2.0]], dtype=jnp.float32)
-nuclei_charges = jnp.array([1.0, 1.0, 1.0], dtype=jnp.float32)
+# nuclei_positions = jnp.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=jnp.float32)
+# nuclei_charges = jnp.array([1.0, 1.0], dtype=jnp.float32)
+nuclei_positions = jnp.array([[0.0, 0.0, 0.0]], dtype=jnp.float32)
+nuclei_charges = jnp.array([1.0], dtype=jnp.float32)
 nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
 
-electron_positions = jnp.array([[0.5, 0.5, 0.5], [1.5, 1.5, 1.5]], dtype=jnp.float32)
-electron_spins = jnp.array([[1.0], [-1.0]], dtype=jnp.float32)
+electron_positions = jnp.array([[0.0, 0.0, 0.0]], dtype=jnp.float32)
+electron_spins = jnp.array([[-1.0]], dtype=jnp.float32)
 electrons = Electron(position=electron_positions, spin=electron_spins)
 
 
@@ -70,6 +79,7 @@ class Chi(nnx.Module):
 
         # TODO: Implement proper attention
         self.attention = nnx.Linear(hdim, hdim, rngs=rngs)
+        self.down_project = nnx.Linear(hdim, 1, rngs=rngs)
 
     def __call__(self, electron: Electron) -> Array:
         spin_classes = jnp.where(electron.spin > 0, 1, 0)
@@ -83,8 +93,7 @@ class Chi(nnx.Module):
         print(f"Combined embedding shape: {combined_embedding.shape}")
         attention_output = self.attention(combined_embedding)
 
-        wave_function_value = jnp.dot(attention_output, attention_output.T)
-        return wave_function_value
+        return self.down_project(attention_output)
 
 
 class SlaterDeterminant(nnx.Module):
@@ -104,20 +113,36 @@ class SlaterDeterminant(nnx.Module):
             return _inner(electrons)
 
         chi_matrix = calc_chis(self.chis, electrons)
+        chi_matrix = jnp.squeeze(chi_matrix, axis=-1)
+
         print(f"Chi matrix shape: {chi_matrix.shape}")
         determinant = jnp.linalg.det(chi_matrix)
         return determinant
 
 
+class JastrowFactor(nnx.Module):
+    """
+        Map from N * R^3 to R, where N is the number of electrons and R^3 is the position of each electron.
+
+        For now just make sure the wave-function falls off at infinity.
+    """
+    def __init__(self):
+        # TODO: Make this a more complex function that has more parameters
+        self.jastrow_strength = nnx.Param(jnp.array(-2.0))
+
+    def __call__(self, electrons: Electron) -> Array:
+        max_pos = jnp.max(jnp.abs(electrons.position))
+        return jnp.exp(self.jastrow_strength * max_pos)
+
+
 class WaveFunction(nnx.Module):
     def __init__(self, num_electrons: int, rngs: nnx.Rngs):
         hidden_dim = 32
+        self.jastrow_factor = JastrowFactor()
         self.slater_determinant = SlaterDeterminant(num_electrons, hidden_dim, rngs)
-        self.jastrow_strength = nnx.Param(jnp.array(-0.01))
 
     def __call__(self, electrons: Electron) -> Array:
-        # TODO: Add a Jastrow factor
-        return self.slater_determinant(electrons)
+        return self.jastrow_factor(electrons) * self.slater_determinant(electrons)
 
 wave_function = WaveFunction(num_electrons=electrons.position.shape[0], rngs=nnx.Rngs(jax.random.key(0)))
 
@@ -140,16 +165,17 @@ def walk_electrons(sigma: Array) -> Callable:
 
     return propose
 
-sigma = 0.2
+sigma = 1.0
 
 @nnx.jit(static_argnames=["num_chains", "num_samples"])
 def sample_from_wavefunction(wave_function: WaveFunction, num_chains: int, num_samples: int, key: Key) -> ArrayLike:
     @jax.jit
     def call_wavefunction_wrapper(electrons: Electron, graphdef: nnx.GraphDef, state: nnx.State) -> Array:
-        model = nnx.merge(graphdef, state)
-        res = model(electrons)
-        print(f"Wave function output shape: {res.shape}")
-        return res
+        wave_function = nnx.merge(graphdef, state)
+        psi = wave_function(electrons)
+        print(f"Wave function output shape: {psi.shape}")
+        return jnp.log(jnp.conjugate(psi) * psi)
+
     graphdef, state = nnx.split(wave_function)
     random_walk = blackjax.additive_step_random_walk(
         partial(call_wavefunction_wrapper, graphdef=graphdef, state=state),
@@ -175,9 +201,52 @@ def sample_from_wavefunction(wave_function: WaveFunction, num_chains: int, num_s
     return electron_state_samples, log_densities, chain_state
 
 chain_key = jax.random.key(0)
-samples, log_densities, chain_state = sample_from_wavefunction(wave_function, 4, 100, chain_key)
+samples, log_densities, chain_state = sample_from_wavefunction(wave_function, 10, 10_000, chain_key)
 
-print(f"Electron samples: {samples}, Log densities: {log_densities}")
+# Discard the burn-in samples from every chain
+burnin = 100
+skip_factor = 2
+samples = jax.tree.map(lambda x: x[burnin::skip_factor], samples)
+log_densities = jax.tree.map(lambda x: x[burnin::skip_factor], log_densities)
 
-    # hamiltonian_value = hamiltonian_fixed_nuclei(electron_state_sample, wave_function)
-    # print(f"Hamiltonian: {hamiltonian_value}, Log Density: {log_density}")
+# Flatten the samples and log_densities for easier handlinga to be free of the chain dimension
+samples, log_densities = jax.tree.map(lambda x: einops.rearrange(x, "n c ... -> (n c) ..."), (samples, log_densities))
+
+fig = go.Figure(data=[go.Scatter3d(
+    x=samples.position[:, 0, 0],
+    y=samples.position[:, 0, 1],
+    z=samples.position[:, 0, 2],
+    mode='markers',
+    marker=dict(size=2),
+)])
+fig.show()
+
+print(f"Electron samples: {samples.position.shape}, Log densities: {log_densities.shape}")
+
+
+@nnx.jit
+def local_energy(sample: Electron, wave_function: WaveFunction) -> Array:
+    print(f"Sample: {sample}")
+    hamiltonian_value = hamiltonian_fixed_nuclei_and_wave(sample)
+    psi = wave_function(sample)
+
+    # Follows because we sample the samples according to the wave function
+    # i.e. the integral we evaluate is already weighed by a |psi|^2
+    # So we write:
+    #   <L> = \int dx psi*(x) (H psi)(x) / \int dx psi*(x)psi(x)
+    # WRITE:
+    #   psi*(x) (H psi(x)) = (psi*(x) * psi(x)) * (H psi)(x)) / psi(x) (multiply and divide by psi(x))
+    #                      = |psi(x)|^2 * Elocal(x)
+    local_energy = hamiltonian_value / psi
+
+    # Notice that we do not need to normalize the wave function here, because
+    # we are already sampling according to the wave function
+    # Exactly because the norm factor is |psi|^2
+    # norm_factor = jnp.conjugate(psi) * psi
+
+    return local_energy
+
+
+local_energies = nnx.vmap(local_energy, in_axes=(0, None))(samples, wave_function)
+avg_energy = jnp.mean(local_energies)
+print(f"Average energy: {avg_energy}")
