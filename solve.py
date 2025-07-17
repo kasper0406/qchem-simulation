@@ -10,6 +10,7 @@ from flax import nnx
 import einops
 from functools import partial
 import plotly.graph_objects as go
+import optax
 
 @jax.tree_util.register_dataclass
 @dataclass
@@ -113,7 +114,7 @@ class SlaterDeterminant(nnx.Module):
             return _inner(electrons)
 
         chi_matrix = calc_chis(self.chis, electrons)
-        chi_matrix = jnp.squeeze(chi_matrix, axis=-1)
+        # chi_matrix = jnp.squeeze(chi_matrix, axis=-1)
 
         print(f"Chi matrix shape: {chi_matrix.shape}")
         determinant = jnp.linalg.det(chi_matrix)
@@ -142,18 +143,8 @@ class WaveFunction(nnx.Module):
         self.slater_determinant = SlaterDeterminant(num_electrons, hidden_dim, rngs)
 
     def __call__(self, electrons: Electron) -> Array:
-        return self.jastrow_factor(electrons) * self.slater_determinant(electrons)
-
-wave_function = WaveFunction(num_electrons=electrons.position.shape[0], rngs=nnx.Rngs(jax.random.key(0)))
-
-wave_function = WaveFunction(num_electrons=electrons.position.shape[0], rngs=nnx.Rngs(jax.random.key(0)))
-direct_wave_func_eval = wave_function(electrons)
-print(f"Direct wave function evaluation: {direct_wave_func_eval}")
-
-h = hamiltonian(nuclei, wave_function)(electrons)
-print(f"Hamiltonian: {h}")
-
-hamiltonian_fixed_nuclei_and_wave = hamiltonian(nuclei, wave_function)
+        result = self.jastrow_factor(electrons) * self.slater_determinant(electrons)
+        return result.squeeze()  # Ensure we return a scalar
 
 
 def walk_electrons(sigma: Array) -> Callable:
@@ -172,6 +163,7 @@ def sample_from_wavefunction(wave_function: WaveFunction, num_chains: int, num_s
     @jax.jit
     def call_wavefunction_wrapper(electrons: Electron, graphdef: nnx.GraphDef, state: nnx.State) -> Array:
         wave_function = nnx.merge(graphdef, state)
+        print(f"Electrons shape: {electrons.position.shape}")
         psi = wave_function(electrons)
         print(f"Wave function output shape: {psi.shape}")
         return jnp.log(jnp.conjugate(psi) * psi)
@@ -181,6 +173,16 @@ def sample_from_wavefunction(wave_function: WaveFunction, num_chains: int, num_s
         partial(call_wavefunction_wrapper, graphdef=graphdef, state=state),
         walk_electrons(sigma)
     )
+    # inv_mass_matrix = jnp.ones_like(initial_position) # Example
+    # nuts_kernel = blackjax.nuts(logprob_fn, step_size=1.0, inverse_mass_matrix=inv_mass_matrix)
+
+    # # Use the window adaptation utility
+    # (last_state, tuned_kernel_params), _ = blackjax.window_adaptation(
+    #     blackjax.nuts,
+    #     logprob_fn,
+    #     num_adaptation_steps=500, # Number of steps for warm-up
+    #     initial_position=initial_position,
+    # )
 
     chain_state = jax.vmap(random_walk.init, axis_size=num_chains, in_axes=None)(electrons)
     # chain_state = random_walk.init(electrons)
@@ -200,35 +202,23 @@ def sample_from_wavefunction(wave_function: WaveFunction, num_chains: int, num_s
 
     return electron_state_samples, log_densities, chain_state
 
-chain_key = jax.random.key(0)
-samples, log_densities, chain_state = sample_from_wavefunction(wave_function, 10, 10_000, chain_key)
-
-# Discard the burn-in samples from every chain
-burnin = 100
-skip_factor = 2
-samples = jax.tree.map(lambda x: x[burnin::skip_factor], samples)
-log_densities = jax.tree.map(lambda x: x[burnin::skip_factor], log_densities)
-
-# Flatten the samples and log_densities for easier handlinga to be free of the chain dimension
-samples, log_densities = jax.tree.map(lambda x: einops.rearrange(x, "n c ... -> (n c) ..."), (samples, log_densities))
-
-fig = go.Figure(data=[go.Scatter3d(
-    x=samples.position[:, 0, 0],
-    y=samples.position[:, 0, 1],
-    z=samples.position[:, 0, 2],
-    mode='markers',
-    marker=dict(size=2),
-)])
-fig.show()
-
-print(f"Electron samples: {samples.position.shape}, Log densities: {log_densities.shape}")
-
+@nnx.jit
+@nnx.value_and_grad(has_aux=True)
+def log_prob_fn(wave_function: WaveFunction, sample: Electron) -> Array:
+    psi = wave_function(sample)
+    log_prob = jnp.log(jnp.conjugate(psi) * psi)
+    return log_prob, psi
 
 @nnx.jit
-def local_energy(sample: Electron, wave_function: WaveFunction) -> Array:
+def local_energy(wave_function: WaveFunction, sample: Electron) -> Array:
     print(f"Sample: {sample}")
     hamiltonian_value = hamiltonian_fixed_nuclei_and_wave(sample)
-    psi = wave_function(sample)
+
+    (log_prob, psi), log_grads = log_prob_fn(wave_function, sample)
+    print(f"Log prob: {log_prob}")
+    print(f"Psi: {psi}")
+    print(f"Log grads: {log_grads}")
+
 
     # Follows because we sample the samples according to the wave function
     # i.e. the integral we evaluate is already weighed by a |psi|^2
@@ -244,9 +234,72 @@ def local_energy(sample: Electron, wave_function: WaveFunction) -> Array:
     # Exactly because the norm factor is |psi|^2
     # norm_factor = jnp.conjugate(psi) * psi
 
-    return local_energy
+    return local_energy, log_grads
 
 
-local_energies = nnx.vmap(local_energy, in_axes=(0, None))(samples, wave_function)
-avg_energy = jnp.mean(local_energies)
-print(f"Average energy: {avg_energy}")
+@nnx.jit
+def optimize_wave_function(wave_function: nnx.Module, optimizer: nnx.Optimizer, samples: Electron):
+    local_energies, log_grads = nnx.vmap(local_energy, in_axes=(None, 0))(wave_function, samples)
+    # print(f"Log gradients: {log_grads}")
+    
+    avg_energy = jnp.mean(local_energies)
+    centered_energies = local_energies - avg_energy
+    print(f"Energy offsets: {centered_energies}")
+
+    loss_gradient = jax.tree.map(
+        lambda log_grads: jnp.expand_dims(centered_energies, axis=tuple(range(1, log_grads.ndim))) * log_grads,
+        log_grads,
+    )
+    # print(f"Loss gradient: {loss_gradient}")
+
+    mean_loss_grads = jax.tree.map(
+        lambda loss_gradient: jnp.mean(loss_gradient, axis=0),
+        loss_gradient,
+    )
+    # print(f"Mean loss gradients: {mean_loss_grads}")
+
+    optimizer.update(mean_loss_grads)
+
+    return avg_energy
+
+
+wave_function = WaveFunction(num_electrons=electrons.position.shape[0], rngs=nnx.Rngs(jax.random.key(0)))
+direct_wave_func_eval = wave_function(electrons)
+print(f"Direct wave function evaluation: {direct_wave_func_eval}")
+
+h = hamiltonian(nuclei, wave_function)(electrons)
+print(f"Hamiltonian: {h}")
+
+optimizer = nnx.Optimizer(wave_function, optax.adamw(1e-3))
+train_key = jax.random.key(0)
+
+total_steps = 5
+for step in range(total_steps):
+    print(f"Step {step}/{total_steps}")
+    train_key, chain_key = jax.random.split(train_key, 2)
+
+    hamiltonian_fixed_nuclei_and_wave = hamiltonian(nuclei, wave_function)
+
+    # Consider restoring from the previous chain state
+    samples, log_densities, chain_state = sample_from_wavefunction(wave_function, 10, 10_000, chain_key)
+
+    # Discard the burn-in samples from every chain
+    burnin = 100
+    skip_factor = 2
+    samples = jax.tree.map(lambda x: x[burnin::skip_factor], samples)
+    log_densities = jax.tree.map(lambda x: x[burnin::skip_factor], log_densities)
+
+    # Flatten the samples and log_densities for easier handlinga to be free of the chain dimension
+    samples, log_densities = jax.tree.map(lambda x: einops.rearrange(x, "n c ... -> (n c) ..."), (samples, log_densities))
+
+    fig = go.Figure(data=[go.Scatter3d(
+        x=samples.position[:, 0, 0],
+        y=samples.position[:, 0, 1],
+        z=samples.position[:, 0, 2],
+        mode='markers',
+        marker=dict(size=2),
+    )])
+    fig.show()
+
+    avg_energy = optimize_wave_function(wave_function, optimizer, samples)
+    print(f"Average energy step {step}: {avg_energy}")
