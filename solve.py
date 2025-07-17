@@ -5,7 +5,6 @@ from jaxtyping import Array, Key, ArrayLike
 from typing import List, Optional, Callable
 from folx import forward_laplacian
 import blackjax
-import distrax
 from flax import nnx
 import einops
 from functools import partial
@@ -24,40 +23,60 @@ class Nucleus:
     position: Array
     charge: Array
 
-def hamiltonian(nuclei: Nucleus, wave_function: nnx.Module):
+@jax.tree_util.register_dataclass
+@dataclass
+class HamiltonianParts:
+    kinetic_energy: Array
+    electron_repulsion: Array
+    nucleus_electron_interaction: Array
+    nucleus_nucleus_interaction: Array
+
+@nnx.jit
+def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucleus):
     nuclea_i, nuclea_j = jnp.triu_indices(nuclei.position.shape[0], k=1)
     nuclei_charge = nuclei.charge[nuclea_i] * nuclei.charge[nuclea_j]
     nuclei_distances = jnp.linalg.norm(nuclei.position[nuclea_i] - nuclei.position[nuclea_j], axis=-1)
     nuclea_interaction = jnp.sum(nuclei_charge / nuclei_distances)
 
-    @jax.jit
-    def call_wavefunction_wrapper(graphdef: nnx.GraphDef, state: nnx.State, electrons: Electron) -> Array:
-        model = nnx.merge(graphdef, state)
-        return model(electrons)
-    graphdef, state = nnx.split(wave_function)
+    @nnx.jit
+    def calculate_kinetic_energy(wave_function: WaveFunction, electrons: Electron) -> Array:
+        position_indices = jnp.arange(electrons.position.shape[0])
 
-    @jax.jit
-    def _inner(electrons: Electron) -> Array:
-        electron_repulsion = 0.0
-        if electrons.position.shape[0] > 1:
-            electron_i, electron_j = jnp.triu_indices(electrons.position.shape[0], k=1)
-            electron_distances = jnp.linalg.norm(electrons.position[electron_i] - electrons.position[electron_j], axis=-1)
-            electron_repulsion = 1/jnp.sum(electron_distances)
+        @nnx.vmap(in_axes=(None, 0, 0), out_axes=0)
+        def calc_terms(wave_function: WaveFunction, position: Array, electron_idx: int) -> Array:
+            # Evaluate the wave function with respect to the electron's position
+            def calc_wrt_position(position: Array, graphdef: nnx.GraphDef, state: nnx.State) -> Array:
+                wave_function = nnx.merge(graphdef, state)
+                return wave_function.eval_wrt_electron_position(position, electron_idx, electrons.position, electrons.spin)
 
-        electron_nuclei_distances = jnp.linalg.norm(
-            electrons.position[:, None] - nuclei.position[None, :], axis=-1
-        )
-        nucleus_electron_interaction = -jnp.sum(nuclei.charge[None, :] / electron_nuclei_distances)
+            graphdef, state = nnx.split(wave_function)
+            laplacian = forward_laplacian(partial(calc_wrt_position, graphdef=graphdef, state=state))(position)
+            return laplacian.laplacian
 
-        laplacian = forward_laplacian(call_wavefunction_wrapper)(graphdef, state, electrons)
-        laplacian = -0.5 * jnp.sum(laplacian.laplacian)
+        terms = calc_terms(wave_function, electrons.position, position_indices)
+        print(f"Laplacian terms shape: {terms.shape}")
+        return -0.5 * jnp.sum(terms)
 
-        # jax.debug.print("Laplacian: {laplacian}, Electron repulsion: {electron_repulsion}, nucleus-electron interaction: {nucleus_electron_interaction}, nucleus-nucleus interaction: {nuclea_interaction}",
-        #                 laplacian=laplacian, electron_repulsion=electron_repulsion,
-        #                 nucleus_electron_interaction=nucleus_electron_interaction,
-        #                 nuclea_interaction=nuclea_interaction)
-        return laplacian + electron_repulsion + nucleus_electron_interaction + nuclea_interaction
-    return _inner
+    electron_repulsion = 0.0
+    if electrons.position.shape[0] > 1:
+        electron_i, electron_j = jnp.triu_indices(electrons.position.shape[0], k=1)
+        electron_distances = jnp.linalg.norm(electrons.position[electron_i] - electrons.position[electron_j], axis=-1)
+        electron_repulsion = jnp.sum(1.0 / electron_distances)
+
+    electron_nuclei_distances = jnp.linalg.norm(
+        electrons.position[:, None] - nuclei.position[None, :], axis=-1
+    )
+    nucleus_electron_interaction = -jnp.sum(nuclei.charge[None, :] / electron_nuclei_distances)
+
+    kinetic_energy = calculate_kinetic_energy(wave_function, electrons)
+
+    result = kinetic_energy + electron_repulsion + nucleus_electron_interaction + nuclea_interaction
+    return result, HamiltonianParts(
+        kinetic_energy=kinetic_energy,
+        electron_repulsion=electron_repulsion,
+        nucleus_electron_interaction=nucleus_electron_interaction,
+        nucleus_nucleus_interaction=nuclea_interaction
+    )
 
 
 # nuclei_positions = jnp.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=jnp.float32)
@@ -66,7 +85,11 @@ nuclei_positions = jnp.array([[0.0, 0.0, 0.0]], dtype=jnp.float32)
 nuclei_charges = jnp.array([1.0], dtype=jnp.float32)
 nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
 
-electron_positions = jnp.array([[0.0, 0.0, 0.0]], dtype=jnp.float32)
+# electron_positions = jnp.array([[0.5, -0.4, 0.2], [1.0, 0.2, 0.6]], dtype=jnp.float32)
+# electron_spins = jnp.array([[-1.0], [1.0]], dtype=jnp.float32)
+# electrons = Electron(position=electron_positions, spin=electron_spins)
+
+electron_positions = jnp.array([[0.5, -0.4, 0.2]], dtype=jnp.float32)
 electron_spins = jnp.array([[-1.0]], dtype=jnp.float32)
 electrons = Electron(position=electron_positions, spin=electron_spins)
 
@@ -114,7 +137,7 @@ class SlaterDeterminant(nnx.Module):
             return _inner(electrons)
 
         chi_matrix = calc_chis(self.chis, electrons)
-        # chi_matrix = jnp.squeeze(chi_matrix, axis=-1)
+        chi_matrix = jnp.squeeze(chi_matrix, axis=-1)
 
         print(f"Chi matrix shape: {chi_matrix.shape}")
         determinant = jnp.linalg.det(chi_matrix)
@@ -146,13 +169,23 @@ class WaveFunction(nnx.Module):
         result = self.jastrow_factor(electrons) * self.slater_determinant(electrons)
         return result.squeeze()  # Ensure we return a scalar
 
+    def eval_wrt_electron_position(self, position: Array, position_index: int, all_positions: Array, spins: Array) -> Array:
+        """
+        Helper function to evaluate the wave function with respect to a specific electron's position.
+        This is used in the Hamiltonian to compute the kinetic term.
+        """
+        modified_positions = all_positions.at[position_index].set(position)
+        electrons = Electron(position=modified_positions, spin=spins)
+        print(f"Electrons: {electrons}")
+        return self(electrons)
+
 
 def walk_electrons(sigma: Array) -> Callable:
     sampler = blackjax.mcmc.random_walk.normal(sigma)
 
     def propose(rng_key: Key, electrons: Electron) -> Electron:
         new_positions = sampler(rng_key, electrons.position)
-        return Electron(position=new_positions, spin=jnp.zeros_like(electrons.spin))
+        return Electron(position=new_positions, spin=electrons.spin)
 
     return propose
 
@@ -210,9 +243,9 @@ def log_prob_fn(wave_function: WaveFunction, sample: Electron) -> Array:
     return log_prob, psi
 
 @nnx.jit
-def local_energy(wave_function: WaveFunction, sample: Electron) -> Array:
+def local_energy(wave_function: WaveFunction, sample: Electron, nuclei: Nucleus) -> Array:
     print(f"Sample: {sample}")
-    hamiltonian_value = hamiltonian_fixed_nuclei_and_wave(sample)
+    hamiltonian_value, _details = hamiltonian(wave_function, sample, nuclei)
 
     (log_prob, psi), log_grads = log_prob_fn(wave_function, sample)
     print(f"Log prob: {log_prob}")
@@ -238,8 +271,8 @@ def local_energy(wave_function: WaveFunction, sample: Electron) -> Array:
 
 
 @nnx.jit
-def optimize_wave_function(wave_function: nnx.Module, optimizer: nnx.Optimizer, samples: Electron):
-    local_energies, log_grads = nnx.vmap(local_energy, in_axes=(None, 0))(wave_function, samples)
+def optimize_wave_function(wave_function: nnx.Module, optimizer: nnx.Optimizer, samples: Electron, nuclei: Nucleus) -> Array:
+    local_energies, log_grads = nnx.vmap(local_energy, in_axes=(None, 0, None))(wave_function, samples, nuclei)
     # print(f"Log gradients: {log_grads}")
     
     avg_energy = jnp.mean(local_energies)
@@ -267,8 +300,9 @@ wave_function = WaveFunction(num_electrons=electrons.position.shape[0], rngs=nnx
 direct_wave_func_eval = wave_function(electrons)
 print(f"Direct wave function evaluation: {direct_wave_func_eval}")
 
-h = hamiltonian(nuclei, wave_function)(electrons)
-print(f"Hamiltonian: {h}")
+h, h_details = hamiltonian(wave_function, electrons, nuclei)
+print(f"Hamiltonian: {h}, details: {h_details}")
+
 
 optimizer = nnx.Optimizer(wave_function, optax.adamw(1e-3))
 train_key = jax.random.key(0)
@@ -277,8 +311,6 @@ total_steps = 5
 for step in range(total_steps):
     print(f"Step {step}/{total_steps}")
     train_key, chain_key = jax.random.split(train_key, 2)
-
-    hamiltonian_fixed_nuclei_and_wave = hamiltonian(nuclei, wave_function)
 
     # Consider restoring from the previous chain state
     samples, log_densities, chain_state = sample_from_wavefunction(wave_function, 10, 10_000, chain_key)
@@ -301,5 +333,5 @@ for step in range(total_steps):
     )])
     fig.show()
 
-    avg_energy = optimize_wave_function(wave_function, optimizer, samples)
+    avg_energy = optimize_wave_function(wave_function, optimizer, samples, nuclei)
     print(f"Average energy step {step}: {avg_energy}")
