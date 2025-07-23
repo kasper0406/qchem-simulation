@@ -69,8 +69,10 @@ def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucl
     nucleus_electron_interaction = -jnp.sum(nuclei.charge[None, :] / electron_nuclei_distances)
 
     kinetic_energy = calculate_kinetic_energy(wave_function, electrons)
+    potential_energy = electron_repulsion + nucleus_electron_interaction + nuclea_interaction
 
-    result = kinetic_energy + electron_repulsion + nucleus_electron_interaction + nuclea_interaction
+    psi = wave_function(electrons)
+    result = kinetic_energy + potential_energy * psi
     return result, HamiltonianParts(
         kinetic_energy=kinetic_energy,
         electron_repulsion=electron_repulsion,
@@ -217,7 +219,8 @@ class WaveFunction(nnx.Module):
         self.slater_determinant = SlaterDeterminant(num_electrons, hidden_dim, rngs)
 
     def __call__(self, electrons: Electron) -> Array:
-        result = self.jastrow_factor(electrons) * self.slater_determinant(electrons)
+        # result = self.jastrow_factor(electrons) * self.slater_determinant(electrons)
+        result = self.slater_determinant(electrons)
         return result.squeeze()  # Ensure we return a scalar
 
     def eval_wrt_electron_position(self, position: Array, position_index: int, all_positions: Array, spins: Array) -> Array:
@@ -440,7 +443,7 @@ for step in range(total_steps):
     print(f"Step {step}/{total_steps}")
 
     train_key, samples, avg_energy, hamiltonian_details = sample_and_optimize_wave_function(
-        wave_function, optimizer, electrons, num_samples=10_000, key=train_key
+        wave_function, optimizer, electrons, num_samples=5000, key=train_key
     )
 
     if step % 1000 == 0:
