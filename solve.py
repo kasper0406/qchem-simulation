@@ -115,11 +115,18 @@ class TransformerLayer(nnx.Module):
         self.pre_attn_norm = nnx.LayerNorm(num_features=hidden_dim, rngs=rngs)
         self.post_attn_norm = nnx.LayerNorm(num_features=hidden_dim, rngs=rngs)
 
-    def __call__(self, inputs: Array) -> Array:
-        h = self.pre_attn_norm(inputs) 
-        r = self.attention(h)
-        h = inputs + r
-        
+    def __call__(self, key_values: Array, query: Array | None = None) -> Array:
+        if query is None:
+            query = key_values
+
+        h = self.pre_attn_norm(key_values)
+        r = self.attention(
+            inputs_q=query,
+            inputs_k=h,
+            inputs_v=h,
+        )
+        h = key_values + r
+
         normalized_h = self.post_attn_norm(h)
         r = nnx.vmap(self.feed_forward)(normalized_h)
         return h + r
@@ -138,15 +145,15 @@ class TransformerStack(nnx.Module):
             layer = TransformerLayer(num_heads=num_heads, hidden_dim=hidden_dim, rngs=rngs)
             self.layers.append(layer)
 
-    def __call__(self, inputs: Array) -> Array:
+    def __call__(self, key_values: Array, query: Array | None = None) -> Array:
         # @nnx.scan(in_axes=(0, nnx.Carry), out_axes=nnx.Carry)
         # def forward(layer: TransformerLayer, x: Array) -> Array:
         #     return layer(x)
 
         # return forward(self.layers, inputs)
-        h = inputs
+        h = key_values
         for layer in self.layers:
-            h = layer(h)
+            h = layer(key_values, query)
         return h
 
 
@@ -157,23 +164,30 @@ def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_hal
     Returns the squared distances and the inverse distances.
     """
     diff = position_a[:, None] - position_b[None, :]
-    distances = jnp.sum(diff ** 2, axis=-1)
-    distances = jnp.sqrt(distances)
+    square_distances = jnp.sum(diff ** 2, axis=-1)
+    distances = jnp.sqrt(square_distances)
 
     if upper_half:
         # Keep only the upper half of the matrix (i.e., distances between different electrons)
         print("Inside upper half calculation")
         upper_indices = jnp.triu_indices(distances.shape[0], k=1)
         distances = distances[upper_indices]
+        square_distances = square_distances[upper_indices]
 
     print(f"Pairwise distances shape: {distances.shape}")
     distances = jnp.reshape(distances, (-1, ))
-    return distances
+    square_distances = jnp.reshape(square_distances, (-1, ))
+    return distances, square_distances
 
 
-# The following constructs a wave function using a neural network, following the
-# terminology described by https://en.wikipedia.org/wiki/Slater_determinant#Multi-particle_case
-class Chi(nnx.Module):
+@nnx.vmap(in_axes=(0, None), out_axes=0)
+def calculate_distance_tokens(position_a: Array, position_b: Array) -> Array:
+    square_distances = jnp.sum((position_a - position_b) ** 2, axis=-1)
+    distances = jnp.sqrt(square_distances)
+    return square_distances, distances
+
+
+class ElectronicAttention(nnx.Module):
     def __init__(self, hdim: int, num_electrons: int, rngs: nnx.Rngs):
         self.spin_encoder = nnx.Embed(2, features=hdim, rngs=rngs)
         self.position_encoder = nnx.Linear(3, hdim, rngs=rngs)
@@ -181,11 +195,14 @@ class Chi(nnx.Module):
         nucleus_distance_dim = nuclei.position.shape[0] * num_electrons
         self.nucleus_distance_encoder = nnx.Linear(nucleus_distance_dim, hdim, rngs=rngs)
 
-        self.electron_distance_encoder = None
-        electron_distance_dim = num_electrons * (num_electrons - 1) // 2
-        if electron_distance_dim > 0:
-            print(f"Electron distance dimension: {electron_distance_dim}")
-            self.electron_distance_encoder = nnx.Linear(electron_distance_dim, hdim, rngs=rngs)
+        # self.electron_distance_encoder = None
+        # electron_distance_dim = num_electrons * (num_electrons - 1) // 2
+        # if electron_distance_dim > 0:
+        #     print(f"Electron distance dimension: {electron_distance_dim}")
+        #     self.electron_distance_encoder = nnx.Linear(electron_distance_dim, hdim, rngs=rngs)
+        #     self.electron_square_distance_encoder = nnx.Linear(electron_distance_dim, hdim, rngs=rngs)
+        self.electron_distance_encoder = nnx.Linear(num_electrons, hdim, rngs=rngs)
+        self.electron_square_distance_encoder = nnx.Linear(num_electrons, hdim, rngs=rngs)
 
         # TODO: Implement proper attention
         self.transformer = TransformerStack(
@@ -196,12 +213,9 @@ class Chi(nnx.Module):
         )
         self.down_project = nnx.Linear(hdim, 1, rngs=rngs)
 
-    def __call__(self, electron: Electron, nuclei: Nucleus) -> Array:
-        spin_classes = jnp.where(electron.spin > 0, 1, 0)
-        print("Spin classes:", spin_classes)
-        spin_embedding = self.spin_encoder(spin_classes)
+    def __call__(self, electron: Electron, nuclei: Nucleus, extra_features: Array | None = None) -> Array:
         position_embedding = self.position_encoder(electron.position)
-        print(f"Position embedding shape: {position_embedding.shape}, Spin embedding shape: {spin_embedding.shape}")
+        print(f"Position embedding shape: {position_embedding.shape}")
 
         # Add in distances between electrons and nuclei
         nucleus_electron_distances = calculate_pairwise_distances(electron.position, nuclei.position)
@@ -210,14 +224,40 @@ class Chi(nnx.Module):
         electron_distance_embedding = jnp.zeros_like(nucleus_distance_embedding)  # Default to zero if no electron distances
         if self.electron_distance_encoder is not None:
             # Add in distances between electrons
-            electron_electron_distances = calculate_pairwise_distances(electron.position, electron.position, upper_half=True)
-            electron_distance_embedding = self.electron_distance_encoder(electron_electron_distances)
+            # electron_electron_distances, electron_electron_square_distances = calculate_pairwise_distances(electron.position, electron.position, upper_half=True)
+            # electron_distance_embedding = self.electron_distance_encoder(electron_electron_distances)
+            # electron_square_distance_embedding = self.electron_square_distance_encoder(electron_electron_square_distances)
 
-        combined_embedding = spin_embedding + position_embedding + nucleus_distance_embedding + electron_distance_embedding
+            electron_square_distances, electron_distances = calculate_distance_tokens(electron.position, electron.position)
+            print(f"Electron distances shape: {electron_distances.shape}, Electron square distances shape: {electron_square_distances.shape}")
+            electron_distance_embedding = self.electron_distance_encoder(electron_distances)
+            electron_square_distance_embedding = self.electron_square_distance_encoder(electron_square_distances)
+            print(f"Electron distance embedding shape: {electron_distance_embedding.shape}, Electron square distance embedding shape: {electron_square_distance_embedding.shape}")
+
+        combined_embedding = position_embedding
+        if extra_features is not None:
+            combined_embedding += extra_features
+
         print(f"Combined embedding shape: {combined_embedding.shape}")
+        # attention_output = self.transformer(combined_embedding, combined_embedding + electron_distance_embedding)
         attention_output = self.transformer(combined_embedding)
 
         return self.down_project(attention_output)
+
+
+# The following constructs a wave function using a neural network, following the
+# terminology described by https://en.wikipedia.org/wiki/Slater_determinant#Multi-particle_case
+class Chi(nnx.Module):
+    def __init__(self, hdim: int, num_electrons: int, rngs: nnx.Rngs):
+        self.spin_encoder = nnx.Embed(2, features=hdim, rngs=rngs)
+        self.electronic_attention = ElectronicAttention(hdim, num_electrons, rngs)
+
+    def __call__(self, electron: Electron, nuclei: Nucleus) -> Array:
+        spin_classes = jnp.squeeze(jnp.where(electron.spin > 0, 1, 0))
+        print("Spin classes:", spin_classes)
+        spin_embedding = self.spin_encoder(spin_classes)
+
+        return self.electronic_attention(electron, nuclei, extra_features=spin_embedding)
 
 
 class SlaterDeterminant(nnx.Module):
@@ -248,28 +288,40 @@ class SlaterDeterminant(nnx.Module):
 class JastrowFactor(nnx.Module):
     """
         Map from N * R^3 to R, where N is the number of electrons and R^3 is the position of each electron.
-
-        For now just make sure the wave-function falls off at infinity.
     """
-    def __init__(self):
-        # TODO: Make this a more complex function that has more parameters
-        # self.jastrow_strength = nnx.Param(jnp.array(-2.0))
-        self.jastrow_strength = -2.0
+    def __init__(self, hdim: int, num_electrons: int, rngs: nnx.Rngs):
+        self.electronic_attention = ElectronicAttention(hdim, num_electrons, rngs)
 
-    def __call__(self, electrons: Electron) -> Array:
-        max_pos = jnp.max(jnp.abs(electrons.position))
-        return jnp.exp(self.jastrow_strength * max_pos)
+    def __call__(self, electrons: Electron, nuclei: Nucleus) -> Array:
+        attention = self.electronic_attention(electrons, nuclei)
+        return jnp.sum(attention)  # Consider max pooling / other pooling methods
 
 
 class WaveFunction(nnx.Module):
     def __init__(self, num_electrons: int, rngs: nnx.Rngs):
         hidden_dim = 32
-        self.jastrow_factor = JastrowFactor()
-        self.slater_determinant = SlaterDeterminant(num_electrons, hidden_dim, rngs)
+        self.jastrow_factor = JastrowFactor(num_electrons=num_electrons, hdim=hidden_dim, rngs=rngs)
+        # self.slater_determinants = SlaterDeterminant(num_electrons, hidden_dim, rngs)
+
+        num_slaters = 2
+        @nnx.split_rngs(splits=num_slaters)
+        @nnx.vmap(in_axes=(None, 0))
+        def create_slater_determinants(num_electrons: int, rng: Key) -> SlaterDeterminant:
+            return SlaterDeterminant(num_electrons, hidden_dim, rng)
+        self.slater_determinant = create_slater_determinants(num_electrons, rngs)
+
+        self.slater_strengths = nnx.Param(jnp.ones((num_slaters,)))
 
     def __call__(self, electrons: Electron, nuclei: Nucleus) -> Array:
-        # result = self.jastrow_factor(electrons) * self.slater_determinant(electrons)
-        result = self.slater_determinant(electrons, nuclei)
+        @nnx.vmap(in_axes=(0, None), out_axes=0)
+        def calc_slater(slater: SlaterDeterminant, electrons: Electron) -> Array:
+            return slater(electrons, nuclei)
+        
+        slaters = jnp.sum(self.slater_strengths * calc_slater(self.slater_determinant, electrons), axis=0)
+        result = self.jastrow_factor(electrons, nuclei) * slaters
+
+        # result = self.jastrow_factor(electrons, nuclei) * self.slater_determinant(electrons, nuclei)
+        # result = self.slater_determinant(electrons, nuclei)
         return result.squeeze()  # Ensure we return a scalar
 
     def eval_wrt_electron_position(self, position: Array, nuclei: Nucleus, position_index: int, all_positions: Array, spins: Array) -> Array:
@@ -340,7 +392,7 @@ def sample_from_wavefunction(wave_function: WaveFunction, nuclei: Nucleus, initi
 
     init_key, step_key = jax.random.split(key, 2)
 
-    sigma = 0.5
+    sigma = 0.25
     graphdef, state = nnx.split(wave_function)
     random_walk = blackjax.additive_step_random_walk(
         partial(call_wavefunction_wrapper, nuclei=nuclei, graphdef=graphdef, state=state),
