@@ -10,20 +10,9 @@ import einops
 from functools import partial
 import plotly.graph_objects as go
 import optax
+from utils import Electron, Nucleus
 
 # jax.config.update("jax_debug_nans", True)
-
-@jax.tree_util.register_dataclass
-@dataclass
-class Electron:
-    position: Array
-    spin: Array
-
-@jax.tree_util.register_dataclass
-@dataclass
-class Nucleus:
-    position: Array
-    charge: Array
 
 @jax.tree_util.register_dataclass
 @dataclass
@@ -184,12 +173,9 @@ def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_hal
         # Keep only the upper half of the matrix (i.e., distances between different electrons)
         print("Inside upper half calculation")
         upper_indices = jnp.triu_indices(distances.shape[0], k=1)
-        distances = distances[upper_indices]
-        square_distances = square_distances[upper_indices]
+        distances = jnp.reshape(distances[upper_indices], (-1, ))
+        square_distances = jnp.reshape(square_distances[upper_indices], (-1, ))
 
-    # print(f"Pairwise distances shape: {distances.shape}")
-    # distances = jnp.reshape(distances, (-1, ))
-    # square_distances = jnp.reshape(square_distances, (-1, ))
     return distances, square_distances
 
 
@@ -202,7 +188,7 @@ def calculate_distances(electron_positions: Array, nucleus_positions: Array) -> 
         - electron_nuclei_distances: Distances between electrons and nuclei
     """
     electron_distances, _ = calculate_pairwise_distances(electron_positions, electron_positions)
-    nucleus_distances, _ = calculate_pairwise_distances(nucleus_positions, nucleus_positions)
+    nucleus_distances, _ = calculate_pairwise_distances(nucleus_positions, nucleus_positions, upper_half=True)
     electron_nuclei_distances, _ = calculate_pairwise_distances(electron_positions, nucleus_positions)
 
     return Distances(
@@ -222,8 +208,13 @@ def calculate_distance_tokens(position_a: Array, position_b: Array) -> Array:
 class ElectronicAttention(nnx.Module):
     def __init__(self, hdim: int, num_electrons: int, num_nuclei: int, rngs: nnx.Rngs):
         self.electron_distance_encoder = nnx.Linear(num_electrons, hdim, rngs=rngs)
-        self.nuclei_distance_encoder = nnx.Linear(num_nuclei, hdim, rngs=rngs)
-        self.nuclei_distance_encoder = nnx.Linear(num_nuclei, hdim, rngs=rngs)
+        self.electron_nuclei_distance_encoder = nnx.Linear(num_nuclei, hdim, rngs=rngs)
+
+        # Set up the nuclei-nuclei distance encoder
+        self.nuclei_distance_encoder = None
+        nuclei_pairs = num_nuclei * (num_nuclei - 1) // 2
+        if nuclei_pairs > 0:
+            self.nuclei_distance_encoder = nnx.Linear(nuclei_pairs, hdim, rngs=rngs)
 
         # TODO: Implement proper attention
         self.transformer = TransformerStack(
@@ -239,9 +230,12 @@ class ElectronicAttention(nnx.Module):
         print("Nuclei distances:", distances.nuclei_distances.shape)
         print("Electron-nuclei distances:", distances.electron_nuclei_distances.shape)
         electron_distance_embedding = self.electron_distance_encoder(distances.electron_distances)
-        nucleus_distance_embedding = self.nuclei_distance_encoder(distances.nuclei_distances)
-        electron_nuclei_distance_embedding = self.nuclei_distance_encoder(distances.electron_nuclei_distances)
-        distance_embedding = electron_distance_embedding + nucleus_distance_embedding + electron_nuclei_distance_embedding
+        electron_nuclei_distance_embedding = self.electron_nuclei_distance_encoder(distances.electron_nuclei_distances)
+        distance_embedding = electron_distance_embedding + electron_nuclei_distance_embedding
+        
+        if self.nuclei_distance_encoder is not None:
+            nucleus_distance_embedding = self.nuclei_distance_encoder(distances.nuclei_distances)
+            distance_embedding = distance_embedding + nucleus_distance_embedding[None, :]
 
         combined_embedding = distance_embedding
         if extra_features is not None:
@@ -519,68 +513,78 @@ def sample_and_optimize_wave_function(wave_function: WaveFunction, optimizer: nn
     return key, samples, avg_energy, hamiltonian_details
 
 
-# Setup nuclei and electrons
-# nuclei_positions = jnp.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=jnp.float32)
-# nuclei_charges = jnp.array([1.0, 1.0], dtype=jnp.float32)
-nuclei_positions = jnp.array([[0.0, 0.0, 0.0]], dtype=jnp.float32)
-nuclei_charges = jnp.array([2], dtype=jnp.int32)
-nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
+def train_wavefunction(
+    wave_function: WaveFunction,
+    optimizer: nnx.Optimizer,
+    nuclei: Nucleus,
+    num_steps: int,
+    num_samples: int,
+    num_chains: int,
+    key: Key,
+):
+    """
+    Optimize the wave function by sampling and updating the parameters.
+    """
+    # Initialize electrons around the nuclei
+    electrons = init_electrons(nuclei, num_chains=num_chains, rng=key)
 
-# electron_positions = jnp.array([[0.5, -0.4, 0.2], [1.0, 0.2, 0.6]], dtype=jnp.float32)
-# electron_spins = jnp.array([[-1], [1]], dtype=jnp.int32)
-# electrons = Electron(position=electron_positions, spin=electron_spins)
+    # Start the optimization loop
+    for step in range(num_steps):
+        print(f"Step {step}/{num_steps}")
 
-# electron_positions = jnp.array([[0.5, -0.4, 0.2]], dtype=jnp.float32)
-# electron_spins = jnp.array([[-1]], dtype=jnp.int32)
-# electrons = Electron(position=electron_positions, spin=electron_spins)
+        key, samples, avg_energy, hamiltonian_details = sample_and_optimize_wave_function(
+            wave_function, optimizer, electrons, nuclei, num_samples=num_samples, key=key
+        )
 
+        if step % 1000 == 0:
+            fig = go.Figure(data=[go.Scatter3d(
+                x=samples.position[:, 0],
+                y=samples.position[:, 1],
+                z=samples.position[:, 2],
+                mode='markers',
+                marker=dict(size=2),
+            )])
+            fig.show()
 
-# Initialize the wave function
-num_electrons = int(jnp.sum(nuclei.charge))
-num_nuclei = int(nuclei.position.shape[0])
-print(f"Number of electrons: {num_electrons}, Number of nuclei: {num_nuclei}")
+        print(f"Average energy step {step}: {avg_energy}")
+        print(f"Hamiltonian details step {step}: {hamiltonian_details}")
 
-wave_function = WaveFunction(
-    num_electrons=num_electrons,
-    num_nuclei=num_nuclei,
-    rngs=nnx.Rngs(0),
-)
-# direct_wave_func_eval = wave_function(electrons, nuclei)
-# print(f"Direct wave function evaluation: {direct_wave_func_eval}")
+if __name__ == "__main__":
+    # Setup nuclei
+    nuclei_positions = jnp.array([[0.0, 0.0, 0.0]], dtype=jnp.float32)
+    nuclei_charges = jnp.array([2], dtype=jnp.int32)
+    nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
 
-# h, h_details = hamiltonian(wave_function, electrons, nuclei)
-# print(f"Hamiltonian: {h}, details: {h_details}")
+    # Initialize the wave function
+    num_electrons = int(jnp.sum(nuclei.charge))
+    num_nuclei = int(nuclei.position.shape[0])
+    print(f"Number of electrons: {num_electrons}, Number of nuclei: {num_nuclei}")
 
-# Start the wave function optimization
-optimizer = nnx.Optimizer(
-    wave_function,
-    optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(1e-3),
+    wave_function = WaveFunction(
+        num_electrons=num_electrons,
+        num_nuclei=num_nuclei,
+        rngs=nnx.Rngs(0),
     )
-)
-train_key = jax.random.key(0)
 
-total_steps = 50_000
-
-num_chains = 150
-electrons = init_electrons(nuclei, num_chains=num_chains, rng=train_key)  # Shape (num_chains, num_electrons, 3)
-for step in range(total_steps):
-    print(f"Step {step}/{total_steps}")
-
-    train_key, samples, avg_energy, hamiltonian_details = sample_and_optimize_wave_function(
-        wave_function, optimizer, electrons, nuclei, num_samples=2000, key=train_key
+    # Start the wave function optimization
+    electronic_optimizer = nnx.Optimizer(
+        wave_function,
+        optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(1e-3),
+        )
     )
+    train_key = jax.random.key(0)
 
-    if step % 1000 == 0:
-        fig = go.Figure(data=[go.Scatter3d(
-            x=samples.position[:, 0, 0],
-            y=samples.position[:, 0, 1],
-            z=samples.position[:, 0, 2],
-            mode='markers',
-            marker=dict(size=2),
-        )])
-        fig.show()
+    total_steps = 50_000
+    num_chains = 150
 
-    print(f"Average energy step {step}: {avg_energy}")
-    print(f"Hamiltonian details step {step}: {hamiltonian_details}")
+    train_wavefunction(
+        wave_function,
+        electronic_optimizer,
+        nuclei,
+        num_steps=total_steps,
+        num_samples=1000,
+        num_chains=num_chains,
+        key=train_key
+    )
