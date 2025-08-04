@@ -12,8 +12,6 @@ import plotly.graph_objects as go
 import optax
 from utils import Electron, Nucleus
 
-# jax.config.update("jax_debug_nans", True)
-
 @jax.tree_util.register_dataclass
 @dataclass
 class HamiltonianParts:
@@ -21,7 +19,6 @@ class HamiltonianParts:
     potential_energy: Array
 
     # Partial contributions to the potential energy
-    psi: Array
     electron_repulsion: Array
     nucleus_electron_interaction: Array
     nucleus_nucleus_interaction: Array
@@ -43,11 +40,21 @@ def calculate_kinetic_energy(wave_function: "WaveFunction", electrons: Electron,
         # Evaluate the wave function with respect to the electron's position
         def calc_wrt_position(position: Array, graphdef: nnx.GraphDef, state: nnx.State) -> Array:
             wave_function = nnx.merge(graphdef, state)
-            return wave_function.eval_wrt_electron_position(position, nuclei, electron_idx, electrons.position, electrons.spin)
+            amplitude, _sign = wave_function.eval_wrt_electron_position(position, nuclei, electron_idx, electrons.position, electrons.spin)
+            return amplitude
 
         graphdef, state = nnx.split(wave_function)
         laplacian = forward_laplacian(partial(calc_wrt_position, graphdef=graphdef, state=state))(position)
-        return laplacian.laplacian
+        # print(f"Jacobian: {amplitude_laplacian.jacobian}")
+        # print(f"Laplacian: {amplitude_laplacian}")
+
+        # Use the identity: ∇^2 psi = psi * (∇^2 log(psi) + |∇log(psi)|^2)
+        # We actually want to calculate (∇^2 psi)/psi (the local energy, and from linearity of the Laplacian term
+        # in the kinetic energy). Therefore, we calculate: (∇^2 psi)/psi = (∇^2 log(psi) + |∇log(psi)|^2)
+        # where |∇log(psi)|^2 = J \dot J^T where J is the Jacobian of the wave function
+        # Notice that since the laplacian is linear, the sign of psi will cancel out in (∇^2 psi)/psi.
+        amplitude = laplacian.laplacian + jnp.dot(laplacian.dense_jacobian, laplacian.dense_jacobian)
+        return amplitude
 
     terms = calc_terms(wave_function, electrons.position, position_indices)
     # print(f"Laplacian terms shape: {terms.shape}")
@@ -62,22 +69,23 @@ def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucl
 
     nuclea_i, nuclea_j = jnp.triu_indices(nuclei.position.shape[0], k=1)
     nuclei_charge = nuclei.charge[nuclea_i] * nuclei.charge[nuclea_j]
-    nuclei_distances = jnp.linalg.norm(nuclei.position[nuclea_i] - nuclei.position[nuclea_j], axis=-1)
+    nuclei_distances = jnp.linalg.norm((nuclei.position[nuclea_i] - nuclei.position[nuclea_j]) + eps, axis=-1)
     nuclea_interaction = jnp.sum(nuclei_charge / (nuclei_distances + eps))
 
     electron_repulsion = 0.0
     if electrons.position.shape[0] > 1:
         electron_i, electron_j = jnp.triu_indices(electrons.position.shape[0], k=1)
-        electron_distances = jnp.linalg.norm(electrons.position[electron_i] - electrons.position[electron_j], axis=-1)
+        electron_distances = jnp.linalg.norm((electrons.position[electron_i] - electrons.position[electron_j]) + eps, axis=-1)
         electron_repulsion = jnp.sum(1.0 / electron_distances)
 
     electron_nuclei_distances = jnp.linalg.norm(
-        electrons.position[:, None] - nuclei.position[None, :], axis=-1
+        (electrons.position[:, None] - nuclei.position[None, :]) + eps, axis=-1
     )
     nucleus_electron_interaction = -jnp.sum(nuclei.charge[None, :] / (electron_nuclei_distances + eps))
 
-    psi = wave_function(electrons, nuclei)
-    kinetic_energy = calculate_kinetic_energy(wave_function, electrons, nuclei) / psi
+    # The wave_function returns the log-probability, and the calculated kinetic energy is
+    # already normalized by psi. See the comments in the `calculate_kinetic_energy` function.
+    kinetic_energy = calculate_kinetic_energy(wave_function, electrons, nuclei)
     potential_energy = electron_repulsion + nucleus_electron_interaction + nuclea_interaction
 
     result = kinetic_energy + potential_energy
@@ -88,7 +96,6 @@ def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucl
         electron_repulsion=electron_repulsion,
         nucleus_electron_interaction=nucleus_electron_interaction,
         nucleus_nucleus_interaction=nuclea_interaction,
-        psi=psi,
     )
 
 
@@ -257,10 +264,11 @@ class Chi(nnx.Module):
 
     def __call__(self, distances: Distances, spins: Array) -> Array:
         spin_classes = jnp.squeeze(jnp.where(spins > 0, 1, 0))
-        print("Spin classes:", spin_classes)
+        # print("Spin classes:", spin_classes)
         spin_embedding = self.spin_encoder(spin_classes)
 
-        return self.electronic_attention(distances, extra_features=spin_embedding)
+        attention = self.electronic_attention(distances, extra_features=spin_embedding)
+        return attention
 
 
 class SlaterDeterminant(nnx.Module):
@@ -280,8 +288,9 @@ class SlaterDeterminant(nnx.Module):
         chi_matrix = jnp.squeeze(chi_matrix, axis=-1)
 
         print(f"Chi matrix shape: {chi_matrix.shape}")
-        determinant = jnp.linalg.det(chi_matrix)
-        return determinant
+        log_det = jnp.linalg.slogdet(chi_matrix)  # log determinant
+        # print(f"Log-Determinant value: {log_det}")
+        return log_det.logabsdet, log_det.sign
 
 
 class JastrowFactor(nnx.Module):
@@ -293,14 +302,56 @@ class JastrowFactor(nnx.Module):
 
     def __call__(self, distances: Array) -> Array:
         attention = self.electronic_attention(distances)
-        return jnp.sum(attention)  # Consider max pooling / other pooling methods
+        return jnp.sum(attention)
+
+
+@jax.jit
+def slater_log_sum_exp(slater_logs, slater_signs, slater_coeffs):
+    """
+    Calculates the log-magnitude and sign of a wavefunction represented
+    as a linear combination of Slater determinants.
+
+    This function uses the log-sum-exp trick adapted for signed sums to
+    ensure numerical stability.
+
+    Args:
+        slater_logs: An array of the log-absolute-values of the determinants.
+        slater_signs: An array of the signs (+1 or -1) of the determinants.
+        slater_coeffs: An array of the linear combination coefficients (c_i).
+
+    Returns:
+        A tuple containing:
+        - log_psi_abs: The log of the absolute value of the total wavefunction.
+        - sign_psi: The sign (+1 or -1) of the total wavefunction.
+    """
+    # Calculate the log-magnitude of each term in the expansion
+    # log|T_i| = log|c_i| + log|D_i|
+    log_term_magnitudes = jnp.log(jnp.abs(slater_coeffs)) + slater_logs
+
+    # Find the dominant term's magnitude (the 'x_max' in the standard trick)
+    max_log_mag = jnp.max(log_term_magnitudes)
+
+    # Calculate the sum of terms, normalized by the largest term to prevent overflow.
+    # The value of each term in the sum is:
+    # sign(c_i)*s_i*exp(log|c_i| + ld_i - max_log_mag)
+    sum_val = jnp.sum(
+        jnp.sign(slater_coeffs) * slater_signs * jnp.exp(log_term_magnitudes - max_log_mag)
+    )
+
+    # The final sign is the sign of this normalized sum
+    sign_psi = jnp.sign(sum_val)
+
+    # The final log-magnitude is the log of the dominant term's magnitude
+    # plus the log of the absolute value of the normalized sum.
+    log_psi_abs = max_log_mag + jnp.log(jnp.abs(sum_val))
+
+    return log_psi_abs, sign_psi
 
 
 class WaveFunction(nnx.Module):
     def __init__(self, num_electrons: int, num_nuclei: int, rngs: nnx.Rngs):
         hidden_dim = 32
         self.jastrow_factor = JastrowFactor(num_electrons=num_electrons, num_nuclei=num_nuclei, hdim=hidden_dim, rngs=rngs)
-        # self.slater_determinants = SlaterDeterminant(num_electrons, hidden_dim, rngs)
 
         num_slaters = 1
         @nnx.split_rngs(splits=num_slaters)
@@ -309,21 +360,22 @@ class WaveFunction(nnx.Module):
             return SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rng)
         self.slater_determinant = create_slater_determinants(num_electrons, num_nuclei, rngs)
 
-        self.slater_strengths = nnx.Param(jnp.ones((num_slaters,)))
+        self.slater_strengths = nnx.Param(jnp.ones((num_slaters,), dtype=jnp.float32))
 
     def __call__(self, electrons: Electron, nuclei: Nucleus) -> Array:
         distances = calculate_distances(electrons.position, nuclei.position)
     
-        @nnx.vmap(in_axes=(0, None, None), out_axes=0)
+        @nnx.vmap(in_axes=(0, None, None), out_axes=(0, 0))
         def calc_slater(slater: SlaterDeterminant, distances: Array, spins: Array) -> Array:
             return slater(distances, spins)
 
-        slaters = jnp.sum(self.slater_strengths * calc_slater(self.slater_determinant, distances, electrons.spin), axis=0)
-        result = self.jastrow_factor(distances) * slaters
+        slater_logs, slater_signs = calc_slater(self.slater_determinant, distances, electrons.spin)
+        slaters_sum, sign = slater_log_sum_exp(slater_logs, slater_signs, self.slater_strengths)
 
-        # result = self.jastrow_factor(electrons, nuclei) * self.slater_determinant(electrons, nuclei)
-        # result = self.slater_determinant(electrons, nuclei)
-        return result.squeeze()  # Ensure we return a scalar
+        # result = jnp.exp(self.jastrow_factor(distances)) * slaters
+        result = self.jastrow_factor(distances) + slaters_sum
+
+        return result.squeeze(), sign  # Ensure we return a scalar
 
     def eval_wrt_electron_position(self, position: Array, nuclei: Nucleus, position_index: int, all_positions: Array, spins: Array) -> Array:
         """
@@ -386,13 +438,14 @@ def sample_from_wavefunction(wave_function: WaveFunction, nuclei: Nucleus, initi
     def call_wavefunction_wrapper(electrons: Electron, nuclei: Nucleus, graphdef: nnx.GraphDef, state: nnx.State) -> Array:
         wave_function = nnx.merge(graphdef, state)
         print(f"Electrons shape: {electrons.position.shape}")
-        psi = wave_function(electrons, nuclei)
-        print(f"Wave function output shape: {psi.shape}")
-        return jnp.log(jnp.conjugate(psi) * psi)
+        log_psi, _sign = wave_function(electrons, nuclei)
+        print(f"Wave function output shape: {log_psi.shape}")
+        # return jnp.log(jnp.conjugate(psi) * psi)
+        return 2 * log_psi
 
     init_key, step_key = jax.random.split(key, 2)
 
-    sigma = 0.25
+    sigma = 0.1
     graphdef, state = nnx.split(wave_function)
     random_walk = blackjax.additive_step_random_walk(
         partial(call_wavefunction_wrapper, nuclei=nuclei, graphdef=graphdef, state=state),
@@ -432,9 +485,10 @@ def sample_from_wavefunction(wave_function: WaveFunction, nuclei: Nucleus, initi
 @nnx.value_and_grad(has_aux=True)
 def log_prob_fn(wave_function: WaveFunction, sample: Electron, nuclei: Nucleus) -> Array:
     eps = 1e-8
-    psi = wave_function(sample, nuclei)
-    log_prob = jnp.log(jnp.conjugate(psi) * psi + eps)
-    return log_prob, psi
+    log_psi, _sign = wave_function(sample, nuclei)
+    # log_prob = jnp.log(jnp.conjugate(psi) * psi + eps)
+    log_prob = 2 * log_psi
+    return log_prob, log_psi
 
 @nnx.jit
 def local_energy(wave_function: WaveFunction, sample: Electron, nuclei: Nucleus) -> Array:
@@ -457,17 +511,17 @@ def local_energy(wave_function: WaveFunction, sample: Electron, nuclei: Nucleus)
     # So we can just compute the local energy as:
     local_energy, hamiltonian_details = hamiltonian(wave_function, sample, nuclei)
 
-    (log_prob, psi), log_grads = log_prob_fn(wave_function, sample, nuclei)
+    (log_prob, log_psi), log_grads = log_prob_fn(wave_function, sample, nuclei)
     # print(f"Log prob: {log_prob}")
     # print(f"Psi: {psi}")
     # print(f"Log grads: {log_grads}")
 
-    return local_energy, log_grads, hamiltonian_details
+    return local_energy, log_grads, hamiltonian_details, log_psi
 
 
 @nnx.jit
 def optimize_wave_function(wave_function: nnx.Module, optimizer: nnx.Optimizer, samples: Electron, nuclei: Nucleus) -> Array:
-    local_energies, log_grads, hamiltonian_details = nnx.vmap(local_energy, in_axes=(None, 0, None))(wave_function, samples, nuclei)
+    local_energies, log_grads, hamiltonian_details, log_psi = nnx.vmap(local_energy, in_axes=(None, 0, None))(wave_function, samples, nuclei)
     hamiltonian_details = jax.tree.map(lambda x: jnp.mean(x, axis=0), hamiltonian_details)
     # print(f"Log gradients: {log_grads}")
     
@@ -489,7 +543,7 @@ def optimize_wave_function(wave_function: nnx.Module, optimizer: nnx.Optimizer, 
 
     optimizer.update(mean_loss_grads)
 
-    return avg_energy, hamiltonian_details
+    return avg_energy, hamiltonian_details, jnp.mean(log_psi)
 
 
 @nnx.jit(static_argnames=["num_samples"])
@@ -508,9 +562,9 @@ def sample_and_optimize_wave_function(wave_function: WaveFunction, optimizer: nn
     # Flatten the samples and log_densities for easier handlinga to be free of the chain dimension
     samples, log_densities = jax.tree.map(lambda x: einops.rearrange(x, "n c ... -> (n c) ..."), (samples, log_densities))
 
-    avg_energy, hamiltonian_details = optimize_wave_function(wave_function, optimizer, samples, nuclei)
+    avg_energy, hamiltonian_details, log_psi = optimize_wave_function(wave_function, optimizer, samples, nuclei)
 
-    return key, samples, avg_energy, hamiltonian_details
+    return key, samples, avg_energy, hamiltonian_details, log_psi
 
 
 def train_wavefunction(
@@ -532,7 +586,7 @@ def train_wavefunction(
     for step in range(num_steps):
         print(f"Step {step}/{num_steps}")
 
-        key, samples, avg_energy, hamiltonian_details = sample_and_optimize_wave_function(
+        key, samples, avg_energy, hamiltonian_details, log_psi = sample_and_optimize_wave_function(
             wave_function, optimizer, electrons, nuclei, num_samples=num_samples, key=key
         )
 
@@ -548,11 +602,12 @@ def train_wavefunction(
 
         print(f"Average energy step {step}: {avg_energy}")
         print(f"Hamiltonian details step {step}: {hamiltonian_details}")
+        print(f"Log psi step {step}: {log_psi}")
 
 if __name__ == "__main__":
     # Setup nuclei
-    nuclei_positions = jnp.array([[0.0, 0.0, 0.0]], dtype=jnp.float32)
-    nuclei_charges = jnp.array([2], dtype=jnp.int32)
+    nuclei_positions = jnp.array([[0.0, 0.0, 0.0], [0.0, 0.0, 3.0]], dtype=jnp.float32)
+    nuclei_charges = jnp.array([3, 1], dtype=jnp.int32)
     nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
 
     # Initialize the wave function

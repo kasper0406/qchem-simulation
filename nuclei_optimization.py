@@ -96,4 +96,9 @@ def optimize_nuclei(
         )
 
     print(f"New nuclei positions: {nuclei.position}")
+
+    nuclei_i, nuclei_j = jnp.triu_indices(nuclei.position.shape[0], k=1)
+    nuclei_distances = jnp.linalg.norm(nuclei.position[nuclei_i] - nuclei.position[nuclei_j], axis=-1)
+    print(f"Nuclei distances: {nuclei_distances}")
+
     return nuclei, opt_state
