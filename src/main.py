@@ -1,7 +1,7 @@
 from absl import app
 import jax
 import jax.numpy as jnp
-from utils import Nucleus
+from src.utils import Nucleus
 from flax import nnx
 from electronic_optimization import WaveFunction, train_wavefunction
 import optax

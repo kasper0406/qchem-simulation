@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import optax
-from utils import Nucleus, Electron
+from src.utils import Nucleus, Electron
 from jaxtyping import Array, Key, ArrayLike
 from flax import nnx
 from electronic_optimization import WaveFunction, sample_from_wavefunction, init_electrons
