@@ -17,7 +17,6 @@ import chex
 @dataclass
 class HamiltonianParts:
     kinetic_energy: Array
-    kinetic_energy_hutch: Array
     potential_energy: Array
 
     # Partial contributions to the potential energy
@@ -62,7 +61,7 @@ def calculate_kinetic_energy(wave_function: "WaveFunction", electrons: Electron,
     # print(f"Laplacian terms shape: {terms.shape}")
     return -0.5 * jnp.sum(terms)
 
-def calculate_kinetic_energy_hutch(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucleus, key: Key) -> Array:
+def calculate_kinetic_energy_hutch(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucleus, key: Key, k: int = 10) -> Array:
     position_indices = jnp.arange(electrons.position.shape[0])
 
     @nnx.vmap(in_axes=(None, 0, 0, 0), out_axes=0)
@@ -75,15 +74,19 @@ def calculate_kinetic_energy_hutch(wave_function: "WaveFunction", electrons: Ele
 
         graphdef, state = nnx.split(wave_function)
         grad_func = jax.grad(partial(calc_wrt_position, graphdef=graphdef, state=state))
-
-        # 2. Generate a random vector `v`
-        # v = jax.random.normal(key, shape=position.shape)
-        v = jax.random.rademacher(key, shape=position.shape).astype(jnp.float32)
-
-        _primals_out, hvp = jax.jvp(grad_func, (position,), (v,))
-        laplacian_estimate = jnp.dot(v, hvp)
-
         grads = grad_func(position)
+
+        def _iteration(key: Key) -> Array:
+            # 2. Generate a random vector `v`
+            v = jax.random.normal(key, shape=position.shape)
+            # v = jax.random.rademacher(key, shape=position.shape).astype(jnp.float32)
+
+            _primals_out, hvp = jax.jvp(grad_func, (position,), (v,))
+            laplacian_estimate = jnp.dot(v, hvp)
+            return laplacian_estimate
+
+        iteration_keys = jax.random.split(key, k)
+        laplacian_estimate = jnp.mean(jax.vmap(_iteration, axis_size=k)(iteration_keys))
 
         # Use the identity: ∇^2 psi = psi * (∇^2 log(psi) + |∇log(psi)|^2)
         # We actually want to calculate (∇^2 psi)/psi (the local energy, and from linearity of the Laplacian term
@@ -124,14 +127,14 @@ def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucl
     # The wave_function returns the log-probability, and the calculated kinetic energy is
     # already normalized by psi. See the comments in the `calculate_kinetic_energy` function.
     # kinetic_energy = calculate_kinetic_energy(wave_function, electrons, nuclei)
+    kinetic_energy = calculate_kinetic_energy_hutch(wave_function, electrons, nuclei, key)
     potential_energy = electron_repulsion + nucleus_electron_interaction + nuclea_interaction
 
-    kinetic_energy_hutch = calculate_kinetic_energy_hutch(wave_function, electrons, nuclei, key)
+    # kinetic_energy_hutch = calculate_kinetic_energy_hutch(wave_function, electrons, nuclei, key)
 
-    result = kinetic_energy_hutch + potential_energy
+    result = kinetic_energy + potential_energy
     return result, HamiltonianParts(
-        kinetic_energy=kinetic_energy_hutch,
-        kinetic_energy_hutch=kinetic_energy_hutch,
+        kinetic_energy=kinetic_energy,
         potential_energy=potential_energy,
 
         electron_repulsion=electron_repulsion,
@@ -221,7 +224,7 @@ def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_hal
 
     if upper_half:
         # Keep only the upper half of the matrix (i.e., distances between different electrons)
-        print("Inside upper half calculation")
+        # print("Inside upper half calculation")
         upper_indices = jnp.triu_indices(distances.shape[0], k=1)
         distances = jnp.reshape(distances[upper_indices], (-1, ))
         square_distances = jnp.reshape(square_distances[upper_indices], (-1, ))
@@ -268,26 +271,25 @@ class ElectronicAttention(nnx.Module):
         if nuclei_pairs > 0:
             self.nuclei_distance_encoder = nnx.Linear(nuclei_pairs, hdim, rngs=rngs)
 
-        # TODO: Implement proper attention
         self.transformer = TransformerStack(
-            num_layers=4,
-            num_heads=1,
+            num_layers=6,
+            num_heads=2,
             hidden_dim=hdim,
             rngs=rngs,
         )
         self.down_project = nnx.Linear(hdim, num_electrons, rngs=rngs)
 
     def __call__(self, distances: Distances, extra_features: Array | None = None) -> Array:
-        print("Electron distances:", distances.electron_distances.shape)
-        print("Nuclei distances:", distances.nuclei_distances.shape)
-        print("Electron-nuclei distances:", distances.electron_nuclei_distances.shape)
+        # print("Electron distances:", distances.electron_distances.shape)
+        # print("Nuclei distances:", distances.nuclei_distances.shape)
+        # print("Electron-nuclei distances:", distances.electron_nuclei_distances.shape)
 
         # In order to make the attention mechanism permutation-equivariant, we need to sort the distances
         distances = jax.tree.map(jnp.sort, distances)
         electron_distance_embedding = self.electron_distance_encoder(distances.electron_distances)
         electron_nuclei_distance_embedding = self.electron_nuclei_distance_encoder(distances.electron_nuclei_distances)
         distance_embedding = electron_distance_embedding + electron_nuclei_distance_embedding
-        print(f"Distance embedding shape: {distance_embedding.shape}")
+        # print(f"Distance embedding shape: {distance_embedding.shape}")
 
         if self.nuclei_distance_encoder is not None:
             nucleus_distance_embedding = self.nuclei_distance_encoder(distances.nuclei_distances)
@@ -295,9 +297,12 @@ class ElectronicAttention(nnx.Module):
 
         combined_embedding = distance_embedding
         if extra_features is not None:
+            # print(f"Extra features shape: {extra_features.shape}")
             combined_embedding += extra_features
 
-        print(f"Combined embedding shape: {combined_embedding.shape}")
+        # print(f"Combined embedding shape: {combined_embedding.shape}")
+
+        # print(f"Combined embedding shape: {combined_embedding.shape}")
         attention_output = self.transformer(combined_embedding)
         # attention_output = self.transformer(combined_embedding, electron_distance_embedding)
 
@@ -317,7 +322,7 @@ class OrbitalNetwork(nnx.Module):
         self.electronic_attention = ElectronicAttention(hdim, num_electrons, num_nuclei, rngs=rngs)
 
     def __call__(self, distances: Distances, spins: Array) -> Array:
-        spin_classes = jnp.squeeze(jnp.where(spins > 0, 1, 0))
+        spin_classes = jnp.where(spins > 0, 1, 0)
         # print("Spin classes:", spin_classes)
         spin_embedding = self.spin_encoder(spin_classes)
 
@@ -330,8 +335,9 @@ class SlaterDeterminant(nnx.Module):
         self.orbital_network = OrbitalNetwork(hidden_dim, num_electrons, num_nuclei, rngs=rngs)
 
     def __call__(self, distances: Array, spins: Array) -> Array:
+        # print(f"Distances: {distances}, spins shape: {spins.shape}")
         orbitals = self.orbital_network(distances, spins)
-        print(f"Orbital matrix shape: {orbitals.shape}")
+        # print(f"Orbital matrix shape: {orbitals.shape}")
         log_det = jnp.linalg.slogdet(orbitals, method="qr")  # log determinant
         # print(f"Log-Determinant value: {log_det}")
         return log_det.logabsdet, log_det.sign
@@ -459,8 +465,24 @@ def init_electrons(nuclei: Nucleus, num_chains: int, rng: Key, sum_of_charges: i
     # Generate random spins for each electron in each chain.
     # spins = jax.random.choice(spin_rng, jnp.array([-1, 1]), shape=(num_chains, num_electrons))
 
-    print(f"Positions shape: {positions.shape}, Spins shape: {spins.shape}")
+    # print(f"Positions shape: {positions.shape}, Spins shape: {spins.shape}")
     return Electron(position=positions, spin=spins)
+
+
+def walk_electrons(sigma: Array) -> Callable:
+    sampler = blackjax.mcmc.random_walk.normal(sigma)
+
+    def propose(rng_key: Key, positions: Array) -> Electron:
+        new_positions = sampler(rng_key, positions)
+        return new_positions
+
+        # Flip the spin of the electrons with a probability of 0.1
+        # flip_mask = jax.random.uniform(rng_key, shape=electrons.spin.shape) < 0.1
+        # new_spins = jnp.where(flip_mask, -electrons.spin, electrons.spin)
+
+        # return Electron(position=new_positions, spin=new_spins)
+
+    return propose
 
 
 def setup_sampler(
@@ -469,9 +491,8 @@ def setup_sampler(
     initial_positions: Electron,
     key: Key,
     num_chains: int,
-    warmup_steps: int = 50,
+    warmup_steps: int = 25,
 ):
-    @jax.jit
     def call_wavefunction_wrapper(electron_positions: Array, electron_spins: Array, nuclei: Nucleus, graphdef: nnx.GraphDef, state: nnx.State) -> Array:
         wave_function = nnx.merge(graphdef, state)
         # print(f"Electrons shape: {electrons.position.shape}")
@@ -490,36 +511,54 @@ def setup_sampler(
                             graphdef=graphdef,
                             state=state
                             )
-    warmup = blackjax.chees_adaptation(logdensity_fn, num_chains)
-    optim = optax.adam(1e-3)
-    (chain_state, parameters), _ = warmup.run(
-        key,
-        initial_positions.position,
-        initial_step_size,
-        optim,
-        warmup_steps,
+
+
+    # warmup = blackjax.chees_adaptation(logdensity_fn, num_chains)
+    # optim = optax.adam(1e-3)
+    # (chain_state, parameters), _ = warmup.run(
+    #     key,
+    #     initial_positions.position,
+    #     initial_step_size,
+    #     optim,
+    #     warmup_steps,
+    # )
+    # kernel = jax.vmap(blackjax.dynamic_hmc(logdensity_fn, **parameters).step, axis_size=num_chains)
+
+
+    random_walk = blackjax.additive_step_random_walk(
+        logdensity_fn,
+        walk_electrons(initial_step_size)
     )
-    kernel = jax.jit(blackjax.dynamic_hmc(logdensity_fn, **parameters).step)
+    chain_state = jax.vmap(random_walk.init)(initial_positions.position)
+    kernel = jax.vmap(random_walk.step, axis_size=num_chains)
+
+
+    # mala = blackjax.mala(logdensity_fn, step_size=0.1)
+    # chain_state = jax.vmap(mala.init)(initial_positions.position)
+    # kernel = jax.vmap(mala.step, axis_size=num_chains)
 
     return chain_state, kernel
 
 
 def sample_from_wavefunction_using_sampler(chain_state, kernel, num_chains: int, num_samples: int, key: Key) -> ArrayLike:
-    @nnx.scan(in_axes=(0, nnx.Carry), out_axes=(0, 0, nnx.Carry), length=num_samples)
+    @nnx.scan(in_axes=(0, nnx.Carry), out_axes=(0, 0, nnx.Carry, 0), length=num_samples)
     def scan_step(step_key, chain_state):
         # new_chain_state, info = step(step_key, chain_state)
         sample_keys = jax.random.split(step_key, num_chains)
-        new_chain_state, info = jax.vmap(kernel, axis_size=num_chains)(sample_keys, chain_state)
-        print(f"New chain state: {new_chain_state}")
+        new_chain_state, info = kernel(sample_keys, chain_state)
+        # print(f"New chain state: {new_chain_state}")
         # electron_state_sample, log_density = new_chain_state
         electron_state_sample = new_chain_state.position
         log_density = new_chain_state.logdensity
-        return electron_state_sample, log_density, new_chain_state
+
+        acceptance_rate = info.acceptance_rate
+
+        return electron_state_sample, log_density, new_chain_state, acceptance_rate
 
     step_keys = jax.random.split(key, num_samples)
-    electron_position_samples, log_densities, chain_state = scan_step(step_keys, chain_state)
+    electron_position_samples, log_densities, chain_state, acceptance_rate = scan_step(step_keys, chain_state)
 
-    return electron_position_samples, log_densities, chain_state
+    return electron_position_samples, log_densities, chain_state, jnp.mean(acceptance_rate)
 
 def sample_from_wavefunction(
     wave_function: WaveFunction,
@@ -535,10 +574,14 @@ def sample_from_wavefunction(
     initial_positions = init_electrons(nuclei, num_chains=num_chains, rng=init_electrons_key, sum_of_charges=sum_of_charges)
     mcmc_chain_state, mcmc_kernel = setup_sampler(wave_function, nuclei, initial_positions, init_sampler_key, num_chains, warmup_steps)
 
-    electron_position_samples, log_densities, mcmc_chain_state = sample_from_wavefunction_using_sampler(mcmc_chain_state, mcmc_kernel, num_chains, num_samples, sample_key)
-    print(f"Electron position shape: {electron_position_samples.shape}, initial position spin shape: {initial_positions.spin.shape}")
-    replicated_spins = jnp.tile(initial_positions.spin, (num_samples, 1, 1, 1))
-    return Electron(position=electron_position_samples, spin=replicated_spins), log_densities, mcmc_chain_state
+    electron_position_samples, log_densities, mcmc_chain_state, acceptance_rate = sample_from_wavefunction_using_sampler(mcmc_chain_state, mcmc_kernel, num_chains, num_samples, sample_key)
+    # print(f"Electron position shape: {electron_position_samples.shape}, initial position spin shape: {initial_positions.spin.shape}")
+    # replicated_spins = jnp.tile(initial_positions.spin, (num_samples, 1, 1, 1))
+
+    electron_position_samples = electron_position_samples[100::4, ...]
+    replicated_spins = jnp.tile(initial_positions.spin, (electron_position_samples.shape[0], 1, 1, 1))
+
+    return Electron(position=electron_position_samples, spin=replicated_spins), log_densities, mcmc_chain_state, acceptance_rate
 
 @nnx.jit
 @nnx.value_and_grad(has_aux=True)
@@ -586,7 +629,7 @@ def optimize_wave_function(wave_function: nnx.Module, optimizer: nnx.Optimizer, 
     
     avg_energy = jnp.mean(local_energies)
     centered_energies = local_energies - avg_energy
-    print(f"Energy offsets: {centered_energies}")
+    # print(f"Energy offsets: {centered_energies}")
 
     loss_gradient = jax.tree.map(
         lambda log_grads: jnp.expand_dims(centered_energies, axis=tuple(range(1, log_grads.ndim))) * log_grads,
@@ -606,6 +649,7 @@ def optimize_wave_function(wave_function: nnx.Module, optimizer: nnx.Optimizer, 
 
 
 # @chex.chexify
+# @nnx.checkify
 @chex.assert_max_traces(1)
 @nnx.jit(static_argnames=["num_samples", "num_chains", "sum_of_charges"])
 def sample_and_optimize_wave_function(
@@ -618,7 +662,7 @@ def sample_and_optimize_wave_function(
     key: Key
 ):
     chain_key, hamiltonian_key = jax.random.split(key, 2)
-    samples, log_densities, _chain_state = sample_from_wavefunction(
+    samples, log_densities, _chain_state, acceptance_rate = sample_from_wavefunction(
         wave_function=wave_function,
         nuclei=nuclei,
         sum_of_charges=sum_of_charges,
@@ -628,12 +672,12 @@ def sample_and_optimize_wave_function(
     )
 
     # Flatten the samples and log_densities for easier handlinga to be free of the chain dimension
-    print(f"Samples shape: {samples.position.shape}, Log densities shape: {log_densities.shape}")
+    # print(f"Samples shape: {samples.position.shape}, Log densities shape: {log_densities.shape}")
     samples, log_densities = jax.tree.map(lambda x: einops.rearrange(x, "n c ... -> (n c) ..."), (samples, log_densities))
 
     avg_energy, hamiltonian_details, log_psi = optimize_wave_function(wave_function, optimizer, samples, nuclei, hamiltonian_key)
 
-    return samples, avg_energy, hamiltonian_details, log_psi
+    return samples, avg_energy, hamiltonian_details, log_psi, acceptance_rate
 
 
 def train_wavefunction(
@@ -651,17 +695,18 @@ def train_wavefunction(
 
     # Setup the MCMC sampler
     init_key, step_key = jax.random.split(key)
+    sum_of_charges = int(jnp.sum(nuclei.charge))
 
     # Start the optimization loop
     step_keys = jax.random.split(step_key, num_steps)
     for step, step_key in enumerate(step_keys):
         print(f"Step {step}/{num_steps}")
 
-        samples, avg_energy, hamiltonian_details, log_psi = sample_and_optimize_wave_function(
+        samples, avg_energy, hamiltonian_details, log_psi, acceptance_rate = sample_and_optimize_wave_function(
             wave_function=wave_function,
             optimizer=optimizer,
             nuclei=nuclei,
-            sum_of_charges=int(jnp.sum(nuclei.charge)),
+            sum_of_charges=int(sum_of_charges),
             num_chains=int(num_chains),
             num_samples=int(num_samples),
             key=step_key,
@@ -680,6 +725,7 @@ def train_wavefunction(
         print(f"Average energy step {step}: {avg_energy}")
         print(f"Hamiltonian details step {step}: {hamiltonian_details}")
         print(f"Log psi step {step}: {log_psi}")
+        print(f"Acceptance rate {step}: {acceptance_rate}")
 
 
 def main(args):
@@ -712,21 +758,21 @@ def main(args):
     train_key = jax.random.key(0)
 
     total_steps = 1000
-    num_chains = 100
+    num_chains = 50
 
     train_wavefunction(
         wave_function,
         electronic_optimizer,
         nuclei,
         num_steps=total_steps,
-        num_samples=250,
+        num_samples=1000,
         num_chains=num_chains,
         key=train_key
     )
 
 
 if __name__ == "__main__":
-    # jax.config.update("jax_debug_nans", True)
+    jax.config.update("jax_debug_nans", True)
     # jax.log_compiles(True)
 
     import os
