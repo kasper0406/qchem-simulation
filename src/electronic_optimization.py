@@ -126,11 +126,9 @@ def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucl
 
     # The wave_function returns the log-probability, and the calculated kinetic energy is
     # already normalized by psi. See the comments in the `calculate_kinetic_energy` function.
-    # kinetic_energy = calculate_kinetic_energy(wave_function, electrons, nuclei)
-    kinetic_energy = calculate_kinetic_energy_hutch(wave_function, electrons, nuclei, key)
+    kinetic_energy = calculate_kinetic_energy(wave_function, electrons, nuclei)
+    # kinetic_energy = calculate_kinetic_energy_hutch(wave_function, electrons, nuclei, key)
     potential_energy = electron_repulsion + nucleus_electron_interaction + nuclea_interaction
-
-    # kinetic_energy_hutch = calculate_kinetic_energy_hutch(wave_function, electrons, nuclei, key)
 
     result = kinetic_energy + potential_energy
     return result, HamiltonianParts(
@@ -172,6 +170,7 @@ class TransformerLayer(nnx.Module):
             query = key_values
 
         h = self.pre_attn_norm(key_values)
+        # h = key_values
         r = self.attention(
             inputs_q=query,
             inputs_k=h,
@@ -205,7 +204,8 @@ class TransformerStack(nnx.Module):
         # return forward(self.layers, inputs)
         h = key_values
         for layer in self.layers:
-            h = layer(h, query)
+            # h = layer(h, query)
+            h = layer(h)
         return h
 
 
@@ -272,7 +272,7 @@ class ElectronicAttention(nnx.Module):
             self.nuclei_distance_encoder = nnx.Linear(nuclei_pairs, hdim, rngs=rngs)
 
         self.transformer = TransformerStack(
-            num_layers=6,
+            num_layers=4,
             num_heads=2,
             hidden_dim=hdim,
             rngs=rngs,
@@ -343,16 +343,82 @@ class SlaterDeterminant(nnx.Module):
         return log_det.logabsdet, log_det.sign
 
 
+class CuspElectrons(nnx.Module):
+    """
+    Models the Kato cusp condition (https://en.wikipedia.org/wiki/Kato_theorem) for electrons.
+    """
+    def __init__(self, num_electrons: int):
+        electron_pairs = (num_electrons * (num_electrons - 1)) // 2
+        self.decay_strengths = None
+        if electron_pairs > 0:
+            self.decay_strengths = nnx.Param(jnp.ones((electron_pairs,)))
+
+    def __call__(self, electron_distances: Array, spins: Array) -> Array:
+        chex.assert_rank(spins, 2)
+        chex.assert_axis_dimension(spins, 1, 1)
+        chex.assert_axis_dimension(spins, 0, electron_distances.shape[0])
+        chex.assert_shape(electron_distances, (spins.shape[0], spins.shape[0]))
+
+        if self.decay_strengths is None:
+            return 0.0
+
+        upper_indices = jnp.triu_indices(electron_distances.shape[0], k=1)
+
+        flat_pairwise_distances = jnp.reshape(electron_distances[upper_indices], (-1, ))
+
+        spins = jnp.squeeze(spins, axis=-1)
+        spin_correlations = spins[:, None] == spins[None, :]
+        cusp_values = jnp.where(spin_correlations, 0.25, 0.5)
+        flat_cusp_values = jnp.reshape(cusp_values[upper_indices], (-1, ))
+
+        # log-Jastrow factor on the form: \sum_{i, j < i} (1/2) * d_{ij} / (1 + decay_strength_{ij} * d_{ij})
+        # where b is the decay strength
+        jastrow_factor = jnp.sum(
+            (flat_cusp_values * flat_pairwise_distances) / (1.0 + self.decay_strengths * flat_pairwise_distances),
+            axis=(-1,),
+        )
+        return jastrow_factor
+
+
+class CuspElectronNuclei(nnx.Module):
+    """
+    Models the Kato cusp condition (https://en.wikipedia.org/wiki/Kato_theorem) for electrons.
+    """
+    def __init__(self, num_electrons: int, num_nuclei: int):
+        self.num_electrons = num_electrons
+        self.num_nuclei = num_nuclei
+
+        self.decay_strengths = nnx.Param(jnp.ones((num_electrons, num_nuclei)))
+
+    def __call__(self, electron_nuclei_distances: Array, nuclei_charges: Array):
+        chex.assert_shape(electron_nuclei_distances, (self.num_electrons, self.num_nuclei))
+        chex.assert_shape(nuclei_charges, (self.num_nuclei,))
+
+        # log-Jastrow factor on the form: \sum_{i, j} -(nuclei_charges{i}) * d_{ij} / (1 + decay_strength_{ij} * d_{ij})
+        # where b is the decay strength
+        jastrow_factor = -jnp.sum(
+            (nuclei_charges[None, :] * electron_nuclei_distances) / (1.0 + self.decay_strengths * electron_nuclei_distances),
+            axis=(-1, -2),
+        )
+        return jastrow_factor
+
+
 class JastrowFactor(nnx.Module):
     """
         Map from N * R^3 to R, where N is the number of electrons and R^3 is the position of each electron.
     """
     def __init__(self, hdim: int, num_electrons: int, num_nuclei: int, rngs: nnx.Rngs):
+        self.electrons_cusp = CuspElectrons(num_electrons)
+        self.nuclei_cusp = CuspElectronNuclei(num_electrons, num_nuclei)
+
         self.electronic_attention = ElectronicAttention(hdim, num_electrons, num_nuclei, rngs)
 
-    def __call__(self, distances: Array) -> Array:
-        attention = self.electronic_attention(distances)
-        return jnp.sum(attention)
+    def __call__(self, distances: Distances, nuclei_charges: Array, electron_spins: Array) -> Array:
+        electron_cusp = self.electrons_cusp(distances.electron_distances, electron_spins)
+        nuclei_cusp = self.nuclei_cusp(distances.electron_nuclei_distances, nuclei_charges)
+
+        # corrections = jnp.sum(self.electronic_attention(distances))
+        return electron_cusp + nuclei_cusp # + corrections
 
 
 @jax.jit
@@ -400,6 +466,9 @@ def slater_log_sum_exp(slater_logs, slater_signs, slater_coeffs):
 
 class WaveFunction(nnx.Module):
     def __init__(self, num_electrons: int, num_nuclei: int, rngs: nnx.Rngs):
+        self.num_electrons = num_electrons
+        self.num_nuclei = num_nuclei
+
         hidden_dim = 32
         self.jastrow_factor = JastrowFactor(num_electrons=num_electrons, num_nuclei=num_nuclei, hdim=hidden_dim, rngs=rngs)
 
@@ -413,6 +482,11 @@ class WaveFunction(nnx.Module):
         self.slater_strengths = nnx.Param(jnp.ones((num_slaters,), dtype=jnp.float32))
 
     def __call__(self, electrons: Electron, nuclei: Nucleus) -> Array:
+        chex.assert_shape(electrons.position, (self.num_electrons, 3))
+        chex.assert_shape(electrons.spin, (self.num_electrons, 1))
+        chex.assert_shape(nuclei.position, (self.num_nuclei, 3))
+        chex.assert_shape(nuclei.charge, (self.num_nuclei, ))
+
         distances = calculate_distances(electrons.position, nuclei.position)
     
         @nnx.vmap(in_axes=(0, None, None), out_axes=(0, 0))
@@ -422,7 +496,7 @@ class WaveFunction(nnx.Module):
         slater_logs, slater_signs = calc_slater(self.slater_determinant, distances, electrons.spin)
         slaters_sum, sign = slater_log_sum_exp(slater_logs, slater_signs, self.slater_strengths)
 
-        result = self.jastrow_factor(distances) + slaters_sum
+        result = self.jastrow_factor(distances, nuclei.charge, electrons.spin) + slaters_sum
 
         return result.squeeze(), sign  # Ensure we return a scalar
 
@@ -506,7 +580,7 @@ def setup_sampler(
     initial_step_size = 0.25
 
     logdensity_fn = partial(call_wavefunction_wrapper,
-                            electron_spins=initial_positions.spin,
+                            electron_spins=initial_positions.spin[0],
                             nuclei=nuclei,
                             graphdef=graphdef,
                             state=state
@@ -533,7 +607,7 @@ def setup_sampler(
     kernel = jax.vmap(random_walk.step, axis_size=num_chains)
 
 
-    # mala = blackjax.mala(logdensity_fn, step_size=0.1)
+    # mala = blackjax.mala(logdensity_fn, step_size=0.001)
     # chain_state = jax.vmap(mala.init)(initial_positions.position)
     # kernel = jax.vmap(mala.step, axis_size=num_chains)
 

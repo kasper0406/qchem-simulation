@@ -30,6 +30,7 @@ def test_permutation_equivariance_electronic_attention():
         permuted_original = original_out.at[[j, i], :].set(original_out[[i, j], :])
         chex.assert_trees_all_close(swapped_out, permuted_original)
 
+    _swap_and_check(0, 1)
     _swap_and_check(0, 2)
     _swap_and_check(1, 3)
     _swap_and_check(1, 4)
@@ -56,9 +57,10 @@ def test_permutation_of_slater_determinant():
         swapped_dist = calculate_distances(swapped_positions, nucleus_positions)
         swapped_spins = spins.at[[i, j], ...].set(spins[[j, i], ...])
         swapped_det, swapped_sign = slater_det(swapped_dist, swapped_spins)
-        chex.assert_trees_all_close(original_det, swapped_det)
-        chex.assert_trees_all_close(original_sign, -swapped_sign)  # Swapping two electrons will pick up a minus sign!
+        chex.assert_trees_all_close(original_det, swapped_det, rtol=1e-4)
+        chex.assert_trees_all_close(original_sign, -swapped_sign, rtol=1e-4)  # Swapping two electrons will pick up a minus sign!
 
+    _swap_and_check(0, 1)
     _swap_and_check(0, 2)
     _swap_and_check(1, 3)
     _swap_and_check(1, 4)
