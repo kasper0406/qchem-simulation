@@ -289,8 +289,8 @@ class DistanceEncoder(nnx.Module):
         direction_encoding = self.direction_encoder(distance.direction)
         combined_encoding = jnp.concat([rbf_proj, direction_encoding], axis=-1)
 
-        distance_sum = jnp.sum(combined_encoding, axis=1)  # Sum to make sure the distance encoding will be permutation equivalent
-        distance_encoding = self.final_proj(distance_sum)
+        distance_mean = jnp.mean(combined_encoding, axis=1)  # Mean to make sure the distance encoding will be permutation equivalent
+        distance_encoding = self.final_proj(distance_mean)
 
         chex.assert_shape(distance_encoding, (None, self.final_proj.out_features))
 
@@ -482,8 +482,8 @@ class JastrowFactor(nnx.Module):
         electron_cusp = self.electrons_cusp(distances.electron_distances.magnitude, electron_spins)
         nuclei_cusp = self.nuclei_cusp(distances.electron_nuclei_distances.magnitude, nuclei_charges)
 
-        # corrections = jnp.sum(self.electronic_attention(distances, distance_encoders=distance_encoders))
-        return electron_cusp + nuclei_cusp # + corrections
+        corrections = jnp.mean(self.electronic_attention(distances, distance_encoders=distance_encoders))
+        return electron_cusp + nuclei_cusp + corrections
 
 
 @jax.jit
@@ -677,7 +677,7 @@ def setup_sampler(
     kernel = jax.vmap(random_walk.step, axis_size=num_chains)
 
 
-    # mala = blackjax.mala(logdensity_fn, step_size=0.001)
+    # mala = blackjax.mala(logdensity_fn, step_size=0.1)
     # chain_state = jax.vmap(mala.init)(initial_positions.position)
     # kernel = jax.vmap(mala.step, axis_size=num_chains)
 
