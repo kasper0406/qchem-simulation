@@ -13,6 +13,7 @@ import optax
 from .utils import Electron, Nucleus
 import chex
 
+
 @jax.tree_util.register_dataclass
 @dataclass
 class HamiltonianParts:
@@ -107,6 +108,55 @@ def calculate_kinetic_energy_hutch(wave_function: "WaveFunction", electrons: Ele
     # print(f"Laplacian terms shape: {terms.shape}")
     return -0.5 * jnp.sum(terms)
 
+def calculate_kinetic_energy_hutchpp(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucleus, key: Key, k: int = 9) -> Array:
+    position_indices = jnp.arange(electrons.position.shape[0])
+
+    @nnx.vmap(in_axes=(None, 0, 0, 0), out_axes=0)
+    def calc_terms(wave_function: WaveFunction, position: Array, electron_idx: int, key: Key) -> Array:
+        # Evaluate the wave function with respect to the electron's position
+        def calc_wrt_position(position: Array, graphdef: nnx.GraphDef, state: nnx.State) -> Array:
+            wave_function = nnx.merge(graphdef, state)
+            amplitude, _sign, _ortho_measure = wave_function.eval_wrt_electron_position(position, nuclei, electron_idx, electrons.position, electrons.spin)
+            return amplitude
+
+        graphdef, state = nnx.split(wave_function)
+        grad_func = jax.grad(partial(calc_wrt_position, graphdef=graphdef, state=state))
+        grads = grad_func(position)
+
+        @jax.vmap
+        def operator(v: Array) -> Array:
+            _primals_out, hvp = jax.jvp(grad_func, (position,), (v,))
+            return hvp
+        
+        m = k // 3
+        samples = jax.random.normal(key, shape=(position.shape[0], 2 * m))
+        s = samples[:, :m]
+        g = samples[:, m:]
+
+        q, _ = jnp.linalg.qr(operator(s))
+        # Tr(Q^T A Q)
+        qr_part = jnp.einsum("ij,ji", q.T, operator(q))  # Computes the trace
+
+        r = jnp.eye(q.shape[0]) - q @ q.T
+        # Tr(G^T R A R^T G) / k
+        hutch_correction = jnp.einsum("ij,ji", g.T @ r, operator(r @ g)) / k
+
+        laplacian_estimate = qr_part + hutch_correction
+
+        # Use the identity: ∇^2 psi = psi * (∇^2 log(psi) + |∇log(psi)|^2)
+        # We actually want to calculate (∇^2 psi)/psi (the local energy, and from linearity of the Laplacian term
+        # in the kinetic energy). Therefore, we calculate: (∇^2 psi)/psi = (∇^2 log(psi) + |∇log(psi)|^2)
+        # where |∇log(psi)|^2 = J \dot J^T where J is the Jacobian of the wave function
+        # Notice that since the laplacian is linear, the sign of psi will cancel out in (∇^2 psi)/psi.
+        amplitude = laplacian_estimate + jnp.dot(grads, grads)
+        return amplitude
+
+    keys = jax.random.split(key, electrons.position.shape[0])
+    terms = calc_terms(wave_function, electrons.position, position_indices, keys)
+    # print(f"Laplacian terms shape: {terms.shape}")
+    return -0.5 * jnp.sum(terms)
+
+
 # @nnx.jit
 def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucleus, key: Key):
     """
@@ -132,8 +182,9 @@ def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucl
 
     # The wave_function returns the log-probability, and the calculated kinetic energy is
     # already normalized by psi. See the comments in the `calculate_kinetic_energy` function.
-    kinetic_energy = calculate_kinetic_energy(wave_function, electrons, nuclei)
+    # kinetic_energy = calculate_kinetic_energy(wave_function, electrons, nuclei)
     # kinetic_energy = calculate_kinetic_energy_hutch(wave_function, electrons, nuclei, key)
+    kinetic_energy = calculate_kinetic_energy_hutchpp(wave_function, electrons, nuclei, key)
     potential_energy = electron_repulsion + nucleus_electron_interaction + nuclea_interaction
 
     result = kinetic_energy + potential_energy
@@ -313,7 +364,7 @@ class ElectronicAttention(nnx.Module):
             self.nuclei_distance_encoder = nnx.Linear(nuclei_pairs, hdim, rngs=rngs)
 
         self.transformer = TransformerStack(
-            num_layers=8,
+            num_layers=4,
             num_heads=2,
             hidden_dim=hdim,
             rngs=rngs,
