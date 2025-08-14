@@ -10,7 +10,7 @@ import einops
 from functools import partial
 import plotly.graph_objects as go
 import optax
-from utils import Electron, Nucleus
+from .utils import Electron, Nucleus
 import chex
 
 @jax.tree_util.register_dataclass
@@ -26,10 +26,16 @@ class HamiltonianParts:
 
 @jax.tree_util.register_dataclass
 @dataclass
+class Distance:
+    magnitude: Array  # Shape (n, n)
+    direction: Array  # Unit vector shape (n, n, 3)
+
+@jax.tree_util.register_dataclass
+@dataclass
 class Distances:
-    electron_distances: Array
-    nuclei_distances: Array
-    electron_nuclei_distances: Array
+    electron_distances: Distance
+    nuclei_distances: Distance
+    electron_nuclei_distances: Distance
 
 
 # @nnx.jit
@@ -41,7 +47,7 @@ def calculate_kinetic_energy(wave_function: "WaveFunction", electrons: Electron,
         # Evaluate the wave function with respect to the electron's position
         def calc_wrt_position(position: Array, graphdef: nnx.GraphDef, state: nnx.State) -> Array:
             wave_function = nnx.merge(graphdef, state)
-            amplitude, _sign = wave_function.eval_wrt_electron_position(position, nuclei, electron_idx, electrons.position, electrons.spin)
+            amplitude, _sign, _ortho_measure = wave_function.eval_wrt_electron_position(position, nuclei, electron_idx, electrons.position, electrons.spin)
             return amplitude
 
         graphdef, state = nnx.split(wave_function)
@@ -69,7 +75,7 @@ def calculate_kinetic_energy_hutch(wave_function: "WaveFunction", electrons: Ele
         # Evaluate the wave function with respect to the electron's position
         def calc_wrt_position(position: Array, graphdef: nnx.GraphDef, state: nnx.State) -> Array:
             wave_function = nnx.merge(graphdef, state)
-            amplitude, _sign = wave_function.eval_wrt_electron_position(position, nuclei, electron_idx, electrons.position, electrons.spin)
+            amplitude, _sign, _ortho_measure = wave_function.eval_wrt_electron_position(position, nuclei, electron_idx, electrons.position, electrons.spin)
             return amplitude
 
         graphdef, state = nnx.split(wave_function)
@@ -106,7 +112,7 @@ def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucl
     """
     For a given state |psi> computes: H|psi> / psi (the local energy).
     """
-    eps = 1e-8
+    eps = 1e-12
 
     nuclea_i, nuclea_j = jnp.triu_indices(nuclei.position.shape[0], k=1)
     nuclei_charge = nuclei.charge[nuclea_i] * nuclei.charge[nuclea_j]
@@ -210,17 +216,19 @@ class TransformerStack(nnx.Module):
 
 
 
-def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_half: bool = False) -> Array:
+def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_half: bool = False) -> Distance:
     """
     Calculate distance features between two sets of positions.
     Returns the squared distances and the inverse distances.
 
     Rows will be from position_a, and columns will be from position_b.
     """
-    eps = 1e-6
+    eps = 1e-12
     diff = position_a[:, None] - position_b[None, :]
     square_distances = jnp.sum(jnp.square(diff), axis=-1)
     distances = jnp.sqrt(square_distances + eps)
+
+    unit_vectors = diff / distances[:, :, None]
 
     if upper_half:
         # Keep only the upper half of the matrix (i.e., distances between different electrons)
@@ -229,7 +237,10 @@ def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_hal
         distances = jnp.reshape(distances[upper_indices], (-1, ))
         square_distances = jnp.reshape(square_distances[upper_indices], (-1, ))
 
-    return distances, square_distances
+    return Distance(
+        magnitude=distances,
+        direction=unit_vectors,
+    )
 
 
 def calculate_distances(electron_positions: Array, nucleus_positions: Array) -> Distances:
@@ -240,11 +251,11 @@ def calculate_distances(electron_positions: Array, nucleus_positions: Array) -> 
         - nuclei_distances: Distances between nuclei
         - electron_nuclei_distances: Distances between electrons and nuclei
     """
-    electron_distances, _ = calculate_pairwise_distances(electron_positions, electron_positions)
-    nucleus_distances, _ = calculate_pairwise_distances(nucleus_positions, nucleus_positions, upper_half=True)
+    electron_distances = calculate_pairwise_distances(electron_positions, electron_positions)
+    nucleus_distances = calculate_pairwise_distances(nucleus_positions, nucleus_positions, upper_half=True)
     # Notice that the order here is important, electrons should be rows, nuclei columns
     # This is to make the electronic attention mechanism work correctly with electron permutations
-    electron_nuclei_distances, _ = calculate_pairwise_distances(electron_positions, nucleus_positions)
+    electron_nuclei_distances = calculate_pairwise_distances(electron_positions, nucleus_positions)
 
     return Distances(
         electron_distances=electron_distances,
@@ -253,18 +264,48 @@ def calculate_distances(electron_positions: Array, nucleus_positions: Array) -> 
     )
 
 
-@nnx.vmap(in_axes=(0, None), out_axes=0)
-def calculate_distance_tokens(position_a: Array, position_b: Array) -> Array:
-    square_distances = jnp.sum((position_a[None, :] - position_b) ** 2, axis=-1)
-    distances = jnp.sqrt(square_distances)
-    return square_distances, distances
+class DistanceEncoder(nnx.Module):
+    def __init__(self, hidden_dim: int, buckets: int, rngs: nnx.Rngs, cutoff: float = 10.0):
+        self.centers = jnp.linspace(0.0, cutoff, buckets)
+        self.sigma = (self.centers[1] -  self.centers[0]) * 1.5
+
+        self.rbf_proj = nnx.Linear(buckets, buckets, rngs=rngs)
+        self.direction_encoder = nnx.Linear(3, buckets, rngs=rngs, use_bias=False)
+        self.final_proj = nnx.Linear(2 * buckets, hidden_dim, rngs=rngs)
+
+    @nnx.vmap(in_axes=(None, 0), out_axes=0)
+    def _rbf_encoding(self, magnitudes: Array):
+        """
+        Radial basis function (RBF) encoding for distance magnitudes.
+        """
+        chex.assert_shape(magnitudes, (None,))  # Expecting a 1D array of magnitudes
+        return jnp.exp(-0.5 * ((magnitudes[:, None] - self.centers[None, :]) / self.sigma) ** 2)
+
+    def __call__(self, distance: Distance):
+        chex.assert_shape(distance.magnitude, (None, None))
+        chex.assert_shape(distance.direction, (None, None, 3))
+
+        rbf_proj = self.rbf_proj(self._rbf_encoding(distance.magnitude))
+        direction_encoding = self.direction_encoder(distance.direction)
+        combined_encoding = jnp.concat([rbf_proj, direction_encoding], axis=-1)
+
+        distance_sum = jnp.sum(combined_encoding, axis=1)  # Sum to make sure the distance encoding will be permutation equivalent
+        distance_encoding = self.final_proj(distance_sum)
+
+        chex.assert_shape(distance_encoding, (None, self.final_proj.out_features))
+
+        return distance_encoding
+
+
+@nnx.dataclass
+class DistanceEncoders(nnx.Object):
+    electron: DistanceEncoder
+    electron_nuclei: DistanceEncoder
+    # nuclei: DistanceEncoder
 
 
 class ElectronicAttention(nnx.Module):
     def __init__(self, hdim: int, num_electrons: int, num_nuclei: int, rngs: nnx.Rngs):
-        self.electron_distance_encoder = nnx.Linear(num_electrons, hdim, rngs=rngs)
-        self.electron_nuclei_distance_encoder = nnx.Linear(num_nuclei, hdim, rngs=rngs)
-
         # Set up the nuclei-nuclei distance encoder
         self.nuclei_distance_encoder = None
         nuclei_pairs = num_nuclei * (num_nuclei - 1) // 2
@@ -272,44 +313,57 @@ class ElectronicAttention(nnx.Module):
             self.nuclei_distance_encoder = nnx.Linear(nuclei_pairs, hdim, rngs=rngs)
 
         self.transformer = TransformerStack(
-            num_layers=4,
+            num_layers=8,
             num_heads=2,
             hidden_dim=hdim,
             rngs=rngs,
         )
-        self.down_project = nnx.Linear(hdim, num_electrons, rngs=rngs)
+        # self.down_project = nnx.Linear(hdim, num_electrons, rngs=rngs)
 
-    def __call__(self, distances: Distances, extra_features: Array | None = None) -> Array:
+    def __call__(self, distances: Distances, distance_encoders: DistanceEncoders, extra_features: Array | None = None) -> Array:
         # print("Electron distances:", distances.electron_distances.shape)
         # print("Nuclei distances:", distances.nuclei_distances.shape)
         # print("Electron-nuclei distances:", distances.electron_nuclei_distances.shape)
 
         # In order to make the attention mechanism permutation-equivariant, we need to sort the distances
-        distances = jax.tree.map(jnp.sort, distances)
-        electron_distance_embedding = self.electron_distance_encoder(distances.electron_distances)
-        electron_nuclei_distance_embedding = self.electron_nuclei_distance_encoder(distances.electron_nuclei_distances)
+        # distances = jax.tree.map(jnp.sort, distances)
+
+        electron_distance_embedding = distance_encoders.electron(distances.electron_distances)
+        electron_nuclei_distance_embedding = distance_encoders.electron_nuclei(distances.electron_nuclei_distances)
+
         distance_embedding = electron_distance_embedding + electron_nuclei_distance_embedding
-        # print(f"Distance embedding shape: {distance_embedding.shape}")
+        print(f"Distance embedding shape: {distance_embedding.shape}")
 
         if self.nuclei_distance_encoder is not None:
-            nucleus_distance_embedding = self.nuclei_distance_encoder(distances.nuclei_distances)
+            # TODO(knielsen): Handle this with a proper distance encoder
+            nucleus_distance_embedding = self.nuclei_distance_encoder(distances.nuclei_distances.magnitude)
             distance_embedding = distance_embedding + nucleus_distance_embedding[None, :]
 
         combined_embedding = distance_embedding
         if extra_features is not None:
             # print(f"Extra features shape: {extra_features.shape}")
+            chex.assert_equal_shape([combined_embedding, extra_features])
             combined_embedding += extra_features
 
-        # print(f"Combined embedding shape: {combined_embedding.shape}")
+        print(f"Combined embedding shape: {combined_embedding.shape}")
 
-        # print(f"Combined embedding shape: {combined_embedding.shape}")
         attention_output = self.transformer(combined_embedding)
         # attention_output = self.transformer(combined_embedding, electron_distance_embedding)
 
-        # Produce a (num_electrons, num_electrons) array
-        # It will have the feature that swapping an electron position i with j, will switch the
-        # output rows.
-        return self.down_project(attention_output)
+        return attention_output
+
+        # # Produce a (num_electrons, num_electrons) array
+        # # It will have the feature that swapping an electron position i with j, will switch the
+        # # output rows.
+        # return self.down_project(attention_output)
+
+
+class OrbitalHead(nnx.Module):
+    def __init__(self, hdim: int, orbital_dim: int, rngs: nnx.Rngs):
+        self.dense = nnx.Linear(hdim, orbital_dim, rngs=rngs)
+
+    def __call__(self, x: Array) -> Array:
+        return self.dense(x)
 
 
 # The following constructs a wave function using a neural network, following the
@@ -321,26 +375,37 @@ class OrbitalNetwork(nnx.Module):
         self.spin_encoder = nnx.Embed(2, features=hdim, rngs=rngs)
         self.electronic_attention = ElectronicAttention(hdim, num_electrons, num_nuclei, rngs=rngs)
 
-    def __call__(self, distances: Distances, spins: Array) -> Array:
+        self.up_head = OrbitalHead(hdim, num_electrons, rngs=rngs)
+        self.down_head = OrbitalHead(hdim, num_electrons, rngs=rngs)
+
+    def __call__(self, distances: Distances, spins: Array, distance_encoders: DistanceEncoders) -> Array:
+        chex.assert_shape(spins, (None, 1))  # Expecting spins to be a column vector
+
         spin_classes = jnp.where(spins > 0, 1, 0)
         # print("Spin classes:", spin_classes)
-        spin_embedding = self.spin_encoder(spin_classes)
+        spin_embedding = jnp.squeeze(self.spin_encoder(spin_classes), axis=-2)
 
-        attention = self.electronic_attention(distances, extra_features=spin_embedding)
-        return attention
+        attention = self.electronic_attention(distances, distance_encoders=distance_encoders, extra_features=spin_embedding)
+        print(f"Attention shape: {attention.shape}")
+
+        # Ensure we create proper nodes in the orbital matrix for different spins
+        orbital_matrix = jnp.where(spins > 0, self.up_head(attention), self.down_head(attention))
+
+        orthonormality_measure = jnp.sum((orbital_matrix.T @ orbital_matrix - jnp.eye(orbital_matrix.shape[0])) ** 2, axis=(-1, -2))
+
+        return orbital_matrix, orthonormality_measure
 
 
 class SlaterDeterminant(nnx.Module):
     def __init__(self, num_electrons: int, num_nuclei: int, hidden_dim: int, rngs: nnx.Rngs):
         self.orbital_network = OrbitalNetwork(hidden_dim, num_electrons, num_nuclei, rngs=rngs)
 
-    def __call__(self, distances: Array, spins: Array) -> Array:
-        # print(f"Distances: {distances}, spins shape: {spins.shape}")
-        orbitals = self.orbital_network(distances, spins)
-        # print(f"Orbital matrix shape: {orbitals.shape}")
+    def __call__(self, distances: Array, spins: Array, distance_encoders: DistanceEncoders) -> Array:
+        orbitals, orthonormality_measure = self.orbital_network(distances, spins, distance_encoders=distance_encoders)
+        print(f"Orbital matrix shape: {orbitals.shape}")
         log_det = jnp.linalg.slogdet(orbitals, method="qr")  # log determinant
-        # print(f"Log-Determinant value: {log_det}")
-        return log_det.logabsdet, log_det.sign
+        print(f"Log-Determinant value: {log_det}")
+        return log_det.logabsdet, log_det.sign, orthonormality_measure
 
 
 class CuspElectrons(nnx.Module):
@@ -411,13 +476,13 @@ class JastrowFactor(nnx.Module):
         self.electrons_cusp = CuspElectrons(num_electrons)
         self.nuclei_cusp = CuspElectronNuclei(num_electrons, num_nuclei)
 
-        self.electronic_attention = ElectronicAttention(hdim, num_electrons, num_nuclei, rngs)
+        self.electronic_attention = ElectronicAttention(hdim, num_electrons, num_nuclei, rngs=rngs)
 
-    def __call__(self, distances: Distances, nuclei_charges: Array, electron_spins: Array) -> Array:
-        electron_cusp = self.electrons_cusp(distances.electron_distances, electron_spins)
-        nuclei_cusp = self.nuclei_cusp(distances.electron_nuclei_distances, nuclei_charges)
+    def __call__(self, distances: Distances, nuclei_charges: Array, electron_spins: Array, distance_encoders: DistanceEncoders) -> Array:
+        electron_cusp = self.electrons_cusp(distances.electron_distances.magnitude, electron_spins)
+        nuclei_cusp = self.nuclei_cusp(distances.electron_nuclei_distances.magnitude, nuclei_charges)
 
-        # corrections = jnp.sum(self.electronic_attention(distances))
+        # corrections = jnp.sum(self.electronic_attention(distances, distance_encoders=distance_encoders))
         return electron_cusp + nuclei_cusp # + corrections
 
 
@@ -469,14 +534,19 @@ class WaveFunction(nnx.Module):
         self.num_electrons = num_electrons
         self.num_nuclei = num_nuclei
 
-        hidden_dim = 32
+        hidden_dim = 64
+        self.distance_encoders = DistanceEncoders(
+            electron=DistanceEncoder(hidden_dim, buckets=64, rngs=rngs),
+            electron_nuclei=DistanceEncoder(hidden_dim, buckets=64, rngs=rngs)
+        )
+
         self.jastrow_factor = JastrowFactor(num_electrons=num_electrons, num_nuclei=num_nuclei, hdim=hidden_dim, rngs=rngs)
 
         num_slaters = 1
         @nnx.split_rngs(splits=num_slaters)
         @nnx.vmap(in_axes=(None, None, 0))
         def create_slater_determinants(num_electrons: int, num_nuclei: int, rng: Key) -> SlaterDeterminant:
-            return SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rng)
+            return SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rngs=rng)
         self.slater_determinant = create_slater_determinants(num_electrons, num_nuclei, rngs)
 
         self.slater_strengths = nnx.Param(jnp.ones((num_slaters,), dtype=jnp.float32))
@@ -489,16 +559,16 @@ class WaveFunction(nnx.Module):
 
         distances = calculate_distances(electrons.position, nuclei.position)
     
-        @nnx.vmap(in_axes=(0, None, None), out_axes=(0, 0))
-        def calc_slater(slater: SlaterDeterminant, distances: Array, spins: Array) -> Array:
-            return slater(distances, spins)
+        @nnx.vmap(in_axes=(0, None, None, None), out_axes=(0, 0, 0))
+        def calc_slater(slater: SlaterDeterminant, distances: Distances, spins: Array, distance_encoders: DistanceEncoders) -> Array:
+            return slater(distances, spins, distance_encoders=distance_encoders)
 
-        slater_logs, slater_signs = calc_slater(self.slater_determinant, distances, electrons.spin)
+        slater_logs, slater_signs, orthonormality_measures = calc_slater(self.slater_determinant, distances, electrons.spin, self.distance_encoders)
         slaters_sum, sign = slater_log_sum_exp(slater_logs, slater_signs, self.slater_strengths)
 
-        result = self.jastrow_factor(distances, nuclei.charge, electrons.spin) + slaters_sum
+        result = self.jastrow_factor(distances, nuclei.charge, electrons.spin, self.distance_encoders) + slaters_sum
 
-        return result.squeeze(), sign  # Ensure we return a scalar
+        return result.squeeze(), sign, jnp.mean(orthonormality_measures)  # Ensure we return a scalar
 
     def eval_wrt_electron_position(self, position: Array, nuclei: Nucleus, position_index: int, all_positions: Array, spins: Array) -> Array:
         """
@@ -571,7 +641,7 @@ def setup_sampler(
         wave_function = nnx.merge(graphdef, state)
         # print(f"Electrons shape: {electrons.position.shape}")
         electrons = Electron(position=electron_positions, spin=electron_spins)
-        log_psi, _sign = wave_function(electrons, nuclei)
+        log_psi, _sign, _ortho_measure = wave_function(electrons, nuclei)
         # print(f"Wave function output shape: {log_psi.shape}")
         return 2 * log_psi
 
@@ -660,8 +730,8 @@ def sample_from_wavefunction(
 @nnx.jit
 @nnx.value_and_grad(has_aux=True)
 def log_prob_fn(wave_function: WaveFunction, sample: Electron, nuclei: Nucleus) -> Array:
-    eps = 1e-8
-    log_psi, _sign = wave_function(sample, nuclei)
+    eps = 1e-12
+    log_psi, _sign, _ortho_measure = wave_function(sample, nuclei)
     log_prob = 2 * log_psi
     return log_prob, log_psi
 
@@ -722,8 +792,6 @@ def optimize_wave_function(wave_function: nnx.Module, optimizer: nnx.Optimizer, 
     return avg_energy, hamiltonian_details, jnp.mean(log_psi)
 
 
-# @chex.chexify
-# @nnx.checkify
 @chex.assert_max_traces(1)
 @nnx.jit(static_argnames=["num_samples", "num_chains", "sum_of_charges"])
 def sample_and_optimize_wave_function(
@@ -801,6 +869,9 @@ def train_wavefunction(
         print(f"Log psi step {step}: {log_psi}")
         print(f"Acceptance rate {step}: {acceptance_rate}")
 
+        energy_balance = 2 * hamiltonian_details.kinetic_energy + hamiltonian_details.potential_energy
+        print(f"Constraints {step}: 2*T + V = {energy_balance}")
+
 
 def main(args):
     # Setup nuclei
@@ -839,7 +910,7 @@ def main(args):
         electronic_optimizer,
         nuclei,
         num_steps=total_steps,
-        num_samples=1000,
+        num_samples=600,
         num_chains=num_chains,
         key=train_key
     )
