@@ -3,7 +3,6 @@ import jax.numpy as jnp
 from dataclasses import dataclass, field
 from jaxtyping import Array, Key, ArrayLike
 from typing import List, Optional, Callable
-from folx import forward_laplacian
 import blackjax
 from flax import nnx
 import einops
@@ -41,6 +40,7 @@ class Distances:
 
 # @nnx.jit
 def calculate_kinetic_energy(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucleus) -> Array:
+    from folx import forward_laplacian
     position_indices = jnp.arange(electrons.position.shape[0])
 
     @nnx.vmap(in_axes=(None, 0, 0), out_axes=0)
@@ -348,7 +348,7 @@ class DistanceEncoder(nnx.Module):
         return distance_encoding
 
 
-@nnx.dataclass
+@dataclass
 class DistanceEncoders(nnx.Object):
     electron: DistanceEncoder
     electron_nuclei: DistanceEncoder
@@ -944,7 +944,7 @@ def main(args):
     )
 
     # Start the wave function optimization
-    electronic_optimizer = nnx.Optimizer(
+    electronic_optimizer = nnx.ModelAndOptimizer(
         wave_function,
         optax.chain(
             optax.clip_by_global_norm(1.0),

@@ -5,6 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qchem-simulation"
 version = "0.1.0"
+dependencies = [
+    "blackjax>=1.2.5",
+    "einops>=0.8.1",
+    "flax>=0.11.1",
+    "folx>=0.2.17",
+    "jax>=0.7.0",
+    "jaxtyping>=0.3.2",
+    "plotly>=6.3.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
