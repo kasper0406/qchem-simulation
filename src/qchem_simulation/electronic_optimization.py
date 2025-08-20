@@ -9,7 +9,7 @@ import einops
 from functools import partial
 import plotly.graph_objects as go
 import optax
-from .utils import Electron, Nucleus
+from .utils import Electron, Nucleus, clip_grad
 import chex
 
 
@@ -138,7 +138,7 @@ def calculate_kinetic_energy_hutchpp(wave_function: "WaveFunction", electrons: E
         qr_part = jnp.einsum("ij,ji", q.T, operator(q))  # Computes the trace
 
         r = jnp.eye(q.shape[0]) - q @ q.T
-        # Tr(G^T R A R^T G) / k
+        # Tr(G^T R A R G) / k
         hutch_correction = jnp.einsum("ij,ji", g.T @ r, operator(r @ g)) / k
 
         laplacian_estimate = qr_part + hutch_correction
@@ -720,17 +720,21 @@ def setup_sampler(
     # kernel = jax.vmap(blackjax.dynamic_hmc(logdensity_fn, **parameters).step, axis_size=num_chains)
 
 
-    random_walk = blackjax.additive_step_random_walk(
-        logdensity_fn,
-        walk_electrons(initial_step_size)
-    )
-    chain_state = jax.vmap(random_walk.init)(initial_positions.position)
-    kernel = jax.vmap(random_walk.step, axis_size=num_chains)
+    # random_walk = blackjax.additive_step_random_walk(
+    #     logdensity_fn,
+    #     walk_electrons(initial_step_size)
+    # )
+    # chain_state = jax.vmap(random_walk.init)(initial_positions.position)
+    # kernel = jax.vmap(random_walk.step, axis_size=num_chains)
 
 
-    # mala = blackjax.mala(logdensity_fn, step_size=0.1)
-    # chain_state = jax.vmap(mala.init)(initial_positions.position)
-    # kernel = jax.vmap(mala.step, axis_size=num_chains)
+    @clip_grad(-1.0, 1.0)
+    def clipped_logdensity_fn(electron_positions: Array):
+        return logdensity_fn(electron_positions)
+
+    mala = blackjax.mala(clipped_logdensity_fn, step_size=0.1)
+    chain_state = jax.vmap(mala.init)(initial_positions.position)
+    kernel = jax.vmap(mala.step, axis_size=num_chains)
 
     return chain_state, kernel
 
