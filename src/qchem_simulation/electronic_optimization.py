@@ -707,6 +707,20 @@ def setup_sampler(
                             state=state
                             )
 
+    # random_walk = blackjax.additive_step_random_walk(
+    #     logdensity_fn,
+    #     walk_electrons(initial_step_size)
+    # )
+    # chain_state = jax.vmap(random_walk.init)(initial_positions.position)
+    # kernel = jax.vmap(random_walk.step, axis_size=num_chains)
+
+
+    # The gradient of the wave-functions tends to infinity around the cusps and nodes.
+    # Clip the gradient during sampling to make it more stable.
+    @clip_grad(-1.0, 1.0)
+    def clipped_logdensity_fn(electron_positions: Array):
+        return logdensity_fn(electron_positions)
+
 
     # warmup = blackjax.chees_adaptation(logdensity_fn, num_chains)
     # optim = optax.adam(1e-3)
@@ -719,18 +733,6 @@ def setup_sampler(
     # )
     # kernel = jax.vmap(blackjax.dynamic_hmc(logdensity_fn, **parameters).step, axis_size=num_chains)
 
-
-    # random_walk = blackjax.additive_step_random_walk(
-    #     logdensity_fn,
-    #     walk_electrons(initial_step_size)
-    # )
-    # chain_state = jax.vmap(random_walk.init)(initial_positions.position)
-    # kernel = jax.vmap(random_walk.step, axis_size=num_chains)
-
-
-    @clip_grad(-1.0, 1.0)
-    def clipped_logdensity_fn(electron_positions: Array):
-        return logdensity_fn(electron_positions)
 
     mala = blackjax.mala(clipped_logdensity_fn, step_size=0.1)
     chain_state = jax.vmap(mala.init)(initial_positions.position)
