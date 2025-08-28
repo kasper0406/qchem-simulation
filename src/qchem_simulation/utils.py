@@ -2,6 +2,57 @@ import jax
 from dataclasses import dataclass, field
 from jaxtyping import Array, Key, ArrayLike
 import jax.numpy as jnp
+from typing import Callable
+from jaxtyping import Array
+from flax import nnx
+import einops
+
+
+def reduce_vmap(
+    *,
+    reduce_fn: Callable,
+    acc_fn: Callable,
+    batch_size: int,
+    init: Array,
+    in_axes: int | None | tuple[int] = 0,
+    out_axes: int | None | tuple[int] = 0,
+):
+    if out_axes != 0:
+        # To relax this, the scan should carry all out_axes
+        raise ValueError("Only out_axes=0 is supported currently.")
+
+    def decorator(f: Callable):
+        def _internal(*args):
+            # TODO(knielsen): Handle the case where in_axes is int | None
+            def reshape_arg(arg, batch_axis):
+                if batch_axis is None:
+                    return arg
+            
+                def reshape_leaf(leaf):
+                    # Put the batch axis as axis 0, and reshape along batch_axis dimension
+                    leaf_swapped = jnp.moveaxis(leaf, batch_axis, 0)
+                    new_shape = (-1, batch_size) + leaf_swapped.shape[1:]
+                    return leaf_swapped.reshape(new_shape)
+
+                return jax.tree.map(reshape_leaf, arg)
+
+            args = [reshape_arg(arg, batch_axis) for arg, batch_axis in zip(args, in_axes)]
+
+            # We have reshaped the input such that the batches axis is always axis 0
+            updated_inaxes = tuple(0 if axis is not None else None for axis in in_axes)
+            @nnx.scan(in_axes=(nnx.Carry, *updated_inaxes), out_axes=(nnx.Carry))
+            def scan_batch(acc, *args):
+                mini_batch = nnx.vmap(f, in_axes=updated_inaxes, out_axes=out_axes)(*args)
+                # TODO(knielsen): This also assumes out_axes=0
+                return acc_fn(acc, reduce_fn(mini_batch, axis=0))
+
+            result = scan_batch(init, *args)
+            return result
+
+        return _internal
+
+    return decorator
+
 
 @jax.tree_util.register_dataclass
 @dataclass

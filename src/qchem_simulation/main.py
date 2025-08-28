@@ -1,17 +1,19 @@
 from absl import app
 import jax
 import jax.numpy as jnp
-from src.utils import Nucleus
 from flax import nnx
-from electronic_optimization import WaveFunction, train_wavefunction
 import optax
-from nuclei_optimization import optimize_nuclei
 import os
+
+from .electronic_optimization import WaveFunction, train_wavefunction
+from .nuclei_optimization import optimize_nuclei
+from .utils import Nucleus
+
 
 def main(_args):
     ### 1 Lithium and 1 Hydrogen nuclei
-    nuclei_positions = jnp.array([[0.0, 0.0, 0.0], [0.0, 0.0, 3.0]], dtype=jnp.float32)
-    nuclei_charges = jnp.array([3, 1], dtype=jnp.int32)
+    nuclei_positions = jnp.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]], dtype=jnp.float32)
+    nuclei_charges = jnp.array([8, 1, 1], dtype=jnp.int32)
     nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
 
     # Initialize the wave function
@@ -26,7 +28,7 @@ def main(_args):
     )
 
     # Start the wave function optimization
-    electronic_optimizer = nnx.Optimizer(
+    electronic_optimizer = nnx.ModelAndOptimizer(
         wave_function,
         optax.chain(
             optax.clip_by_global_norm(1.0),
@@ -46,15 +48,16 @@ def main(_args):
         electronic_key, nuclei_key = jax.random.split(key)
 
         electronic_steps = 50
-        nuclei_steps = 5
-        num_chains = 150
+        nuclei_steps = 10
+        num_chains = 25
+        num_samples = 500
 
         train_wavefunction(
             wave_function,
             electronic_optimizer,
             nuclei,
             num_steps=electronic_steps,
-            num_samples=1000,
+            num_samples=num_samples,
             num_chains=num_chains,
             key=electronic_key
         )
@@ -65,6 +68,8 @@ def main(_args):
             nuclei_opt_state,
             nuclei_steps,
             nuclei,
+            num_electron_samples=num_samples,
+            num_electron_chains=num_chains,
             key=nuclei_key,
         )
 

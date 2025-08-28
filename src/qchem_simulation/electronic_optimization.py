@@ -79,7 +79,7 @@ def calculate_kinetic_energy_hutch(wave_function: "WaveFunction", electrons: Ele
             amplitude, _sign, _ortho_measure = wave_function.eval_wrt_electron_position(position, nuclei, electron_idx, electrons.position, electrons.spin)
             return amplitude
 
-        graphdef, state = nnx.split(wave_function)
+        graphdef, state = (wave_function)
         grad_func = jax.grad(partial(calc_wrt_position, graphdef=graphdef, state=state))
         grads = grad_func(position)
 
@@ -593,7 +593,7 @@ class WaveFunction(nnx.Module):
 
         self.jastrow_factor = JastrowFactor(num_electrons=num_electrons, num_nuclei=num_nuclei, hdim=hidden_dim, rngs=rngs)
 
-        num_slaters = 1
+        num_slaters = num_nuclei
         @nnx.split_rngs(splits=num_slaters)
         @nnx.vmap(in_axes=(None, None, 0))
         def create_slater_determinants(num_electrons: int, num_nuclei: int, rng: Key) -> SlaterDeterminant:
@@ -734,7 +734,7 @@ def setup_sampler(
     # kernel = jax.vmap(blackjax.dynamic_hmc(logdensity_fn, **parameters).step, axis_size=num_chains)
 
 
-    mala = blackjax.mala(clipped_logdensity_fn, step_size=0.1)
+    mala = blackjax.mala(clipped_logdensity_fn, step_size=0.05)
     chain_state = jax.vmap(mala.init)(initial_positions.position)
     kernel = jax.vmap(mala.step, axis_size=num_chains)
 
@@ -769,6 +769,8 @@ def sample_from_wavefunction(
     num_chains: int,
     num_samples: int,
     warmup_steps: int = 100,
+    mcmc_burnin_steps: int = 100,
+    mcmc_thinning_factor: int = 2,
 ):
     init_electrons_key, init_sampler_key, sample_key = jax.random.split(key, 3)
 
@@ -779,7 +781,7 @@ def sample_from_wavefunction(
     # print(f"Electron position shape: {electron_position_samples.shape}, initial position spin shape: {initial_positions.spin.shape}")
     # replicated_spins = jnp.tile(initial_positions.spin, (num_samples, 1, 1, 1))
 
-    electron_position_samples = electron_position_samples[100::4, ...]
+    electron_position_samples = electron_position_samples[mcmc_burnin_steps::mcmc_thinning_factor, ...]
     replicated_spins = jnp.tile(initial_positions.spin, (electron_position_samples.shape[0], 1, 1, 1))
 
     return Electron(position=electron_position_samples, spin=replicated_spins), log_densities, mcmc_chain_state, acceptance_rate
@@ -827,7 +829,7 @@ def optimize_wave_function(wave_function: nnx.Module, optimizer: nnx.Optimizer, 
     local_energies, log_grads, hamiltonian_details, log_psi = nnx.vmap(local_energy, in_axes=(None, 0, None, 0))(wave_function, samples, nuclei, keys)
     hamiltonian_details = jax.tree.map(lambda x: jnp.mean(x, axis=0), hamiltonian_details)
     # print(f"Log gradients: {log_grads}")
-    
+
     avg_energy = jnp.mean(local_energies)
     centered_energies = local_energies - avg_energy
     # print(f"Energy offsets: {centered_energies}")

@@ -1,72 +1,80 @@
 import jax
 import jax.numpy as jnp
 import optax
-from src.utils import Nucleus, Electron
-from jaxtyping import Array, Key, ArrayLike
+from jaxtyping import Array, Key
 from flax import nnx
-from electronic_optimization import WaveFunction, sample_from_wavefunction, init_electrons
+from .utils import Nucleus, Electron, reduce_vmap
+from .electronic_optimization import WaveFunction, sample_from_wavefunction, hamiltonian
 import einops
-
-@nnx.value_and_grad
-def hamiltonian(nuclei_position: Array, nuclei_charge: Array, electron_samples: Array):
-    """
-    nuclei_position: Array of shape (num_nuclei, 3) representing the positions of the nuclei.
-    nuclei_charge: Array of shape (num_nuclei,) representing the charges of the nuclei.
-    electron_samples: Array of shape (num_samples, num_electrons, 3) representing the sampled electron positions.
-
-    The nuclei positions and charges are split because the differentiation of the Hamiltonian
-    is done with respect to the nuclei positions, while the charges are constant.
-
-    Calculate the Hamiltonian for the nuclei given the electrons.
-    Notice given this is treated as a electrostatics problem, there is no kinetic energy term,
-    so the Hamiltonian is simply the potential energy due to the interaction between nuclei and electrons.
-
-    The potential between the nuclei and electrons is approximated from mcmc samples of the electrons from the wave function.
-    """
-
-    eps = 1e-8  # Small value to avoid division by zero
-
-    # Potential energy between nuclei and electrons
-    flat_electrons = einops.rearrange(electron_samples, "s e d -> (s e) d")
-    electron_nuclei_distances = jnp.linalg.norm(
-        flat_electrons[:, None] - nuclei_position[None, :], axis=-1
-    )
-    nucleus_electron_interaction = -jnp.sum(nuclei_charge[None, :] / (electron_nuclei_distances + eps))
-    # Scale the interaction by the number of electrons
-    nuclei_electrons = nucleus_electron_interaction / electron_samples.shape[0]
-
-    # Potential energy between nuclei
-    nuclei_i, nuclei_j = jnp.triu_indices(nuclei_position.shape[0], k=1)
-    nuclei_charge = nuclei_charge[nuclei_i] * nuclei_charge[nuclei_j]
-    nuclei_distances = jnp.linalg.norm(nuclei_position[nuclei_i] - nuclei_position[nuclei_j], axis=-1)
-    nuclei_nuclei = jnp.sum(nuclei_charge / (nuclei_distances + eps))
-
-    return nuclei_electrons + nuclei_nuclei
+from functools import partial
 
 
-@nnx.jit(static_argnames=["num_electron_samples", "optimizer"])
+def force_func(wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
+    # @clip_grad(-1.0, 1.0)
+    def hamiltonian_grad(
+        nuclei_positions: Array,  # Gradient wrt. nuclei positions
+        wave_func_graphdef: WaveFunction,
+        wave_func_state: WaveFunction,
+        electron_sample: Electron,
+        nuclei_charges: Array,
+        key: Key
+    ):
+        wave_function = nnx.merge(wave_func_graphdef, wave_func_state)
+        nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
+        energy, _details = hamiltonian(wave_function, electron_sample, nuclei, key)
+        return energy
+
+    zero_forces = jnp.zeros_like(nuclei.position)
+    @reduce_vmap(in_axes=(None, 0, None, None, 0), out_axes=0, init=zero_forces, reduce_fn=jnp.sum, acc_fn=jnp.add, batch_size=100)
+    def forces_fn(
+        wave_function: WaveFunction,
+        electron_sample: Electron,
+        nuclei_positions: Array,
+        nuclei_charges: Array,
+        key: Key
+    ) -> Array:
+        wave_func_graphdef, wave_func_state = nnx.split(wave_function)
+        forces_fn = jax.grad(hamiltonian_grad)
+        # print(f"Nuclei positions: {nuclei_positions}")
+        forces = forces_fn(nuclei_positions, wave_func_graphdef, wave_func_state, electron_sample, nuclei_charges, key)
+        # print(f"Forces: {forces}")
+        return forces
+
+    hamiltonian_keys = jax.random.split(key, electron_samples.position.shape[0])
+    # Differentiate wrt nuclei_positions
+    forces = forces_fn(wave_function, electron_samples, nuclei.position, nuclei.charge, hamiltonian_keys)
+    return forces / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean force divide by the number of samples
+
+
+@nnx.jit(static_argnames=["num_electron_samples", "num_electron_chains", "sum_of_charges", "optimizer"])
 def sample_and_optimize(
     wave_function: WaveFunction,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
     nuclei: Nucleus,
-    initial_electrons: Electron,
     num_electron_samples: int,
+    num_electron_chains: int,
+    sum_of_charges: int,
     key: Key,
 ):
-    electron_samples, _, _ = sample_from_wavefunction(wave_function, nuclei, initial_electrons, num_electron_samples, key)
-    electron_samples = electron_samples.position
+    sample_key, force_key = jax.random.split(key, 2)
 
-    burnin = 100
-    skip_factor = 2
-    electron_samples = electron_samples[burnin::skip_factor]
-    electron_samples = einops.rearrange(electron_samples, "n c ... -> (n c) ...")
+    electron_samples, _log_densities, _chain_state, _acceptance_rate = sample_from_wavefunction(
+        wave_function=wave_function,
+        nuclei=nuclei,
+        sum_of_charges=sum_of_charges,
+        key=sample_key,
+        num_chains=num_electron_chains,
+        num_samples=num_electron_samples,
+    )
+    electron_samples = jax.tree.map(lambda x: einops.rearrange(x, "n c ... -> (n c) ..."), electron_samples)
 
-    _hamiltonian_value, grads = hamiltonian(nuclei.position, nuclei.charge, electron_samples)
+    forces = force_func(wave_function, electron_samples, nuclei, force_key)
 
-    updates, opt_state = optimizer.update(grads, opt_state, nuclei.position)
+    updates, opt_state = optimizer.update(forces, opt_state, nuclei.position)
     new_position = optax.apply_updates(nuclei.position, updates)
     new_nuclei = Nucleus(position=new_position, charge=nuclei.charge)
+
     return new_nuclei, opt_state
 
 
@@ -76,26 +84,27 @@ def optimize_nuclei(
     opt_state: optax.OptState,
     num_steps: int,
     nuclei: Nucleus,
+    num_electron_samples: int,
+    num_electron_chains: int,
     key: Key,
 ):
-    num_chains = 150
-    num_samples = 1000
-
+    sum_of_charges = int(jnp.sum(nuclei.charge))
     step_keys = jax.random.split(key, num_steps)
     for step, step_key in zip(range(num_steps), step_keys):
         print(f"Nuclei optimization step {step + 1}/{num_steps}")
-        initial_electrons = init_electrons(nuclei, num_chains=num_chains, rng=step_key)
+
         nuclei, opt_state = sample_and_optimize(
             wave_function,
             optimizer,
             opt_state,
             nuclei,
-            initial_electrons,
-            num_samples,
-            step_key
+            num_electron_samples=num_electron_samples,
+            num_electron_chains=num_electron_chains,
+            sum_of_charges=sum_of_charges,
+            key=step_key,
         )
 
-    print(f"New nuclei positions: {nuclei.position}")
+        print(f"Nuclei positions {step + 1}: {nuclei.position}")
 
     nuclei_i, nuclei_j = jnp.triu_indices(nuclei.position.shape[0], k=1)
     nuclei_distances = jnp.linalg.norm(nuclei.position[nuclei_i] - nuclei.position[nuclei_j], axis=-1)
