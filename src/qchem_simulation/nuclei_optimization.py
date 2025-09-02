@@ -3,14 +3,14 @@ import jax.numpy as jnp
 import optax
 from jaxtyping import Array, Key
 from flax import nnx
-from .utils import Nucleus, Electron, reduce_vmap
+from .utils import Nucleus, Electron, reduce_vmap, clip_grad
 from .electronic_optimization import WaveFunction, sample_from_wavefunction, hamiltonian
 import einops
 from functools import partial
 
 
 def force_func(wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
-    # @clip_grad(-1.0, 1.0)
+    @clip_grad(-1.0, 1.0)
     def hamiltonian_grad(
         nuclei_positions: Array,  # Gradient wrt. nuclei positions
         wave_func_graphdef: WaveFunction,

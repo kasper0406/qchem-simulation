@@ -9,7 +9,7 @@ import einops
 from functools import partial
 import plotly.graph_objects as go
 import optax
-from .utils import Electron, Nucleus, clip_grad
+from .utils import Electron, Nucleus, clip_grad, reduce_vmap
 import chex
 
 
@@ -734,7 +734,7 @@ def setup_sampler(
     # kernel = jax.vmap(blackjax.dynamic_hmc(logdensity_fn, **parameters).step, axis_size=num_chains)
 
 
-    mala = blackjax.mala(clipped_logdensity_fn, step_size=0.05)
+    mala = blackjax.mala(clipped_logdensity_fn, step_size=0.005)
     chain_state = jax.vmap(mala.init)(initial_positions.position)
     kernel = jax.vmap(mala.step, axis_size=num_chains)
 
@@ -824,8 +824,9 @@ def local_energy(wave_function: WaveFunction, sample: Electron, nuclei: Nucleus,
 
 
 @nnx.jit
-def optimize_wave_function(wave_function: nnx.Module, optimizer: nnx.Optimizer, samples: Electron, nuclei: Nucleus, key: Key) -> Array:
+def optimize_wave_function_full(wave_function: nnx.Module, optimizer: nnx.Optimizer, samples: Electron, nuclei: Nucleus, key: Key) -> Array:
     keys = jax.random.split(key, samples.position.shape[0])
+
     local_energies, log_grads, hamiltonian_details, log_psi = nnx.vmap(local_energy, in_axes=(None, 0, None, 0))(wave_function, samples, nuclei, keys)
     hamiltonian_details = jax.tree.map(lambda x: jnp.mean(x, axis=0), hamiltonian_details)
     # print(f"Log gradients: {log_grads}")
@@ -849,6 +850,73 @@ def optimize_wave_function(wave_function: nnx.Module, optimizer: nnx.Optimizer, 
     optimizer.update(mean_loss_grads)
 
     return avg_energy, hamiltonian_details, jnp.mean(log_psi)
+
+@nnx.jit
+def optimize_wave_function_batched(wave_function: WaveFunction, optimizer: nnx.Optimizer, samples: Electron, nuclei: Nucleus, key: Key, batch_size: int = 100) -> Array:
+
+    @nnx.scan(
+        in_axes=(None, nnx.Carry, 0, 0),
+        out_axes=nnx.Carry,
+    )
+    def process_batch(wave_function: WaveFunction, carry, batch_samples: Electron, batch_key):
+        weighed_grads_sum, local_energy_sum, grads_sum, hamiltonian_details_sum, log_psi_sum = carry
+        keys = jax.random.split(batch_key, batch_samples.position.shape[0])
+
+        local_energies, log_grads, hamiltonian_details, log_psi = nnx.vmap(local_energy, in_axes=(None, 0, None, 0))(wave_function, batch_samples, nuclei, keys)
+        hamiltonian_details = jax.tree.map(partial(jnp.sum, axis=0), hamiltonian_details)
+
+        weighed_grads_sum = jax.tree.map(
+            lambda loss_gradient, acc: acc + jnp.sum(jnp.expand_dims(local_energies, axis=tuple(range(1, loss_gradient.ndim))) * loss_gradient, axis=0),
+            log_grads, weighed_grads_sum
+        )
+
+        grads_sum = jax.tree.map(
+            lambda loss_gradient, acc: acc + jnp.sum(loss_gradient, axis=0),
+            log_grads, grads_sum,
+        )
+
+        local_energy_sum = local_energy_sum + jnp.sum(local_energies, axis=0)
+        hamiltonian_details_sum = jax.tree.map(lambda x, acc: acc + x, hamiltonian_details, hamiltonian_details_sum)
+        log_psi_sum = log_psi_sum + jnp.sum(log_psi, axis=0)
+
+        return weighed_grads_sum, local_energy_sum, grads_sum, hamiltonian_details_sum, log_psi_sum
+
+
+    # Construct accumulators
+    single_electron_samples = jax.tree.map(lambda x: x[0, ...], samples)
+    _, grads_shape, hamiltonian_details_shape, _  = nnx.eval_shape(local_energy, wave_function, single_electron_samples, nuclei, jax.random.key(0))
+
+    init_grads = jax.tree.map(jnp.zeros_like, grads_shape)
+    init_weighed_grads = jax.tree.map(jnp.zeros_like, grads_shape)
+    init_hamiltonian_details = jax.tree.map(jnp.zeros_like, hamiltonian_details_shape)
+
+    # Re-arrange the input samples
+    num_samples = samples.position.shape[0]
+    chex.assert_is_divisible(num_samples, batch_size)
+    num_batches = num_samples // batch_size
+    batch_samples = jax.tree.map(lambda x: einops.rearrange(x, "(b n) ... -> b n ...", b=num_batches), samples)
+
+    # Compute the batches sequentially
+    batch_keys = jax.random.split(key, num_batches)
+    weighed_grads_sum, local_energy_sum, grads_sum, hamiltonian_details_sum, log_psi_sum = process_batch(
+        wave_function, (init_weighed_grads, 0.0, init_grads, init_hamiltonian_details, 0.0), batch_samples, batch_keys
+    )
+
+    # Compute the mean loss grads by using linearity of expectations:
+    #   E[(E_L - <E_L>) * log_grads] = E[E_L * log_grads] - <E_L> * E[log_grads]
+    # Then because we take the sum, we get the average by dividing by the number of samples
+    avg_energy = local_energy_sum / num_samples
+    mean_loss_grads = jax.tree.map(
+        lambda w, g: (w / num_samples) - avg_energy * (g / num_samples),
+        weighed_grads_sum, grads_sum
+    )
+    hamiltonian_details = jax.tree.map(lambda x: x / num_samples, hamiltonian_details_sum)
+    log_psi = log_psi_sum / num_samples
+    optimizer.update(mean_loss_grads)
+
+    return avg_energy, hamiltonian_details, log_psi
+
+optimize_wave_function = optimize_wave_function_batched
 
 
 @chex.assert_max_traces(1)

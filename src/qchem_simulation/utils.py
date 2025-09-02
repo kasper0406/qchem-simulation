@@ -105,7 +105,11 @@ def clip_grad(min_val, max_val):
 
             # Clip the gradients. jax.tree_util.tree_map handles pytrees
             # (e.g., tuples/lists of gradients for multiple arguments).
-            clipper = lambda grad: jnp.clip(grad, min_val, max_val)
+            def clipper(grad: Array):
+                if grad.dtype == jax.dtypes.float0:
+                    # A float0 array will not be clipped
+                    return grad
+                return jnp.clip(grad, min_val, max_val)
             clipped_grads = jax.tree_util.tree_map(clipper, original_grads)
 
             return clipped_grads
