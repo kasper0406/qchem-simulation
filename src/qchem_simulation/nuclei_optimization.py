@@ -11,7 +11,7 @@ from functools import partial
 
 def nuclei_energy_grad(wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
     # @clip_grad_elementwise(-1.0, 1.0)
-    @clip_grad_global(max_norm=1.0)
+    @clip_grad_global(max_norm=10.0)
     def hamiltonian_grad(
         nuclei_positions: Array,  # Gradient wrt. nuclei positions
         wave_func_graphdef: WaveFunction,
@@ -26,7 +26,7 @@ def nuclei_energy_grad(wave_function: WaveFunction, electron_samples: Electron, 
         return energy
 
     zero_grads = jnp.zeros_like(nuclei.position)
-    @reduce_vmap(in_axes=(None, 0, None, None, 0), out_axes=0, init=zero_grads, reduce_fn=jnp.sum, acc_fn=jnp.add, batch_size=100)
+    @reduce_vmap(in_axes=(None, 0, None, None, 0), out_axes=0, init=zero_grads, reduce_fn=jnp.sum, acc_fn=jnp.add, batch_size=50)
     def energy_grad(
         wave_function: WaveFunction,
         electron_sample: Electron,
@@ -46,6 +46,11 @@ def nuclei_energy_grad(wave_function: WaveFunction, electron_samples: Electron, 
     return grad / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean force divide by the number of samples
 
 
+def jiggle_nuclei(nuclei_positions: Array, key: Key, scale: float = 1e-2):
+    noise = jax.random.normal(key, nuclei_positions.shape) * scale
+    return nuclei_positions + noise
+
+
 @nnx.jit(static_argnames=["num_electron_samples", "num_electron_chains", "sum_of_charges", "optimizer"])
 def sample_and_optimize(
     wave_function: WaveFunction,
@@ -57,7 +62,7 @@ def sample_and_optimize(
     sum_of_charges: int,
     key: Key,
 ):
-    sample_key, grad_key = jax.random.split(key, 2)
+    sample_key, grad_key, jiggle_key = jax.random.split(key, 3)
 
     electron_samples, _log_densities, _chain_state, _acceptance_rate = sample_from_wavefunction(
         wave_function=wave_function,
@@ -73,6 +78,9 @@ def sample_and_optimize(
 
     updates, opt_state = optimizer.update(nuclei_grads, opt_state, nuclei.position)
     new_position = optax.apply_updates(nuclei.position, updates)
+
+    new_position = jiggle_nuclei(new_position, jiggle_key)
+
     new_nuclei = Nucleus(position=new_position, charge=nuclei.charge)
 
     return new_nuclei, opt_state

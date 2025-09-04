@@ -31,12 +31,12 @@ def main(_args):
     electronic_optimizer = nnx.ModelAndOptimizer(
         wave_function,
         optax.chain(
-            optax.clip_by_global_norm(2.0),
+            optax.clip_by_global_norm(1.0),
             optax.adam(1e-3),
         )
     )
 
-    nuclei_optimizer = optax.sgd(1.0)
+    nuclei_optimizer = optax.adam(1e-2)
     nuclei_opt_state = nuclei_optimizer.init(nuclei.position)
 
     iterations = 100
@@ -49,8 +49,8 @@ def main(_args):
 
         electronic_steps = 10
         nuclei_steps = 1
-        num_chains = 50
-        num_samples = 1500
+        num_chains = 15
+        num_samples = 500
 
         train_wavefunction(
             wave_function,
@@ -75,6 +75,11 @@ def main(_args):
 
 
 if __name__ == "__main__":
+    jax.config.update("jax_compilation_cache_dir", "./jax_cache")
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+
     jax.config.update("jax_debug_nans", True)
     # jax.config.update("jax_disable_jit", True)
 

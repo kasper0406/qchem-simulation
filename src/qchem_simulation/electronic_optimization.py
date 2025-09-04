@@ -279,7 +279,7 @@ def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_hal
     square_distances = jnp.sum(jnp.square(diff), axis=-1)
     distances = jnp.sqrt(square_distances + eps)
 
-    unit_vectors = diff / distances[:, :, None]
+    unit_vectors = diff * jax.lax.rsqrt(distances[:, :, None] + eps)
 
     if upper_half:
         # Keep only the upper half of the matrix (i.e., distances between different electrons)
@@ -325,8 +325,13 @@ class DistanceEncoder(nnx.Module):
         self.sigma = (self.centers[1] -  self.centers[0]) * 1.5
 
         self.rbf_proj = nnx.Linear(buckets, buckets, rngs=rngs)
-        self.direction_encoder = nnx.Linear(3, buckets, rngs=rngs, use_bias=False)
-        self.final_proj = nnx.Linear(2 * buckets, hidden_dim, rngs=rngs)
+        self.direction_proj = nnx.Linear(15, buckets, rngs=rngs)
+
+        self.feature_up_proj = nnx.Linear(2 * buckets, hidden_dim, rngs=rngs)
+        self.feature_down_proj = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
+        self.feature_attn = nnx.MultiHeadAttention(num_heads=1, in_features=hidden_dim, decode=False, rngs=rngs)
+
+        self.final_proj = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
 
     @nnx.vmap(in_axes=(None, 0), out_axes=0)
     def _rbf_encoding(self, magnitudes: Array):
@@ -336,16 +341,58 @@ class DistanceEncoder(nnx.Module):
         chex.assert_shape(magnitudes, (None,))  # Expecting a 1D array of magnitudes
         return jnp.exp(-0.5 * ((magnitudes[:, None] - self.centers[None, :]) / self.sigma) ** 2)
 
+    @nnx.vmap(in_axes=(None, 0), out_axes=0)
+    def _real_sh_L3(self, direction: Array):
+        chex.assert_shape(direction, (None, 3))  # Expecting a 3D unit vector
+        x, y, z = jnp.moveaxis(direction, -1, 0)
+
+        # l = 1 (dipoles)
+        c1 = 0.4886025119029199
+        Y1m1 = c1 * y
+        Y10  = c1 * z
+        Y11  = c1 * x
+
+        # l = 2 (quadrupoles)
+        Y2m2 = 1.0925484305920792 * x * y
+        Y2m1 = 1.0925484305920792 * y * z
+        Y20  = 0.31539156525252005 * (3.0 * z*z - 1.0)
+        Y21  = 1.0925484305920792 * x * z
+        Y22  = 0.5462742152960396 * (x*x - y*y)
+
+        # l = 3 (octupoles) – fully-normalized real SH
+        Y3m3 = 0.5900435899266435 * y * (3.0 * x*x - y*y)
+        Y3m2 = 2.890611442640554 * x * y * z
+        Y3m1 = 0.4570457994644658 * y * (5.0 * z*z - 1.0)
+        Y30  = 0.3731763325901154 * z * (5.0 * z*z - 3.0)
+        Y31  = 0.4570457994644658 * x * (5.0 * z*z - 1.0)
+        Y32  = 1.445305721320277 * z * (x*x - y*y)
+        Y33  = 0.5900435899266435 * x * (x*x - 3.0 * y*y)
+
+        parts = [
+            Y1m1, Y10, Y11,
+            Y2m2, Y2m1, Y20, Y21, Y22,
+            Y3m3, Y3m2, Y3m1, Y30, Y31, Y32, Y33
+        ]
+        stacked = jnp.stack(parts, axis=-1)
+        chex.assert_shape(stacked, (None, 15))
+
+        return stacked
+
     def __call__(self, distance: Distance):
         chex.assert_shape(distance.magnitude, (None, None))
         chex.assert_shape(distance.direction, (None, None, 3))
 
-        rbf_proj = self.rbf_proj(self._rbf_encoding(distance.magnitude))
-        direction_encoding = self.direction_encoder(distance.direction)
-        combined_encoding = jnp.concat([rbf_proj, direction_encoding], axis=-1)
+        radial_features = self.rbf_proj(self._rbf_encoding(distance.magnitude))
+        direction_features = self.direction_proj(self._real_sh_L3(distance.direction))
+        combined_features = jnp.concat([radial_features, direction_features], axis=-1)
 
-        distance_mean = jnp.mean(combined_encoding, axis=1)  # Mean to make sure the distance encoding will be permutation equivalent
-        distance_encoding = self.final_proj(distance_mean)
+        up_projected = self.feature_up_proj(combined_features)
+        activated = nnx.gelu(up_projected)
+        down_projected = self.feature_down_proj(activated)
+        attended = self.feature_attn(down_projected)
+
+        pooled_attention = jnp.sum(attended, axis=1)  # Mean to make sure the distance encoding will be permutation equivalent
+        distance_encoding = self.final_proj(pooled_attention)
 
         chex.assert_shape(distance_encoding, (None, self.final_proj.out_features))
 
@@ -830,19 +877,31 @@ def local_energy(wave_function: WaveFunction, sample: Electron, nuclei: Nucleus,
 
 
 @nnx.jit
-def optimize_wave_function_full(wave_function: nnx.Module, optimizer: nnx.Optimizer, samples: Electron, nuclei: Nucleus, key: Key) -> Array:
+def optimize_wave_function_full(
+    wave_function: nnx.Module,
+    optimizer: nnx.Optimizer,
+    samples: Electron,
+    nuclei: Nucleus,
+    *,
+    lambda_virial: float = 1e-3,
+key: Key) -> Array:
     keys = jax.random.split(key, samples.position.shape[0])
 
     local_energies, log_grads, hamiltonian_details, log_psi = nnx.vmap(local_energy, in_axes=(None, 0, None, 0))(wave_function, samples, nuclei, keys)
-    hamiltonian_details = jax.tree.map(lambda x: jnp.mean(x, axis=0), hamiltonian_details)
     # print(f"Log gradients: {log_grads}")
 
     avg_energy = jnp.mean(local_energies)
     centered_energies = local_energies - avg_energy
     # print(f"Energy offsets: {centered_energies}")
 
+    # The introduced penalty terms is to:
+    #  1. keep 2T+V=0 (virial theorem)
+    #  2. keep the orbitals orthonormal
+    virial_penalty = jnp.square(2 * hamiltonian_details.kinetic_energy + hamiltonian_details.potential_energy)
+    penalty_terms = lambda_virial * virial_penalty # + lambda_ortho * orthonormality_measure
+
     loss_gradient = jax.tree.map(
-        lambda log_grads: jnp.expand_dims(centered_energies, axis=tuple(range(1, log_grads.ndim))) * log_grads,
+        lambda log_grads: jnp.expand_dims(centered_energies + penalty_terms, axis=tuple(range(1, log_grads.ndim))) * log_grads,
         log_grads,
     )
     # print(f"Loss gradient: {loss_gradient}")
@@ -855,24 +914,41 @@ def optimize_wave_function_full(wave_function: nnx.Module, optimizer: nnx.Optimi
 
     optimizer.update(mean_loss_grads)
 
-    return avg_energy, hamiltonian_details, jnp.mean(log_psi)
+    mean_hamiltonian_details = jax.tree.map(lambda x: jnp.mean(x, axis=0), hamiltonian_details)
+    return avg_energy, mean_hamiltonian_details, jnp.mean(log_psi)
 
 @nnx.jit
-def optimize_wave_function_batched(wave_function: WaveFunction, optimizer: nnx.Optimizer, samples: Electron, nuclei: Nucleus, key: Key, batch_size: int = 100) -> Array:
+def optimize_wave_function_batched(
+    wave_function: WaveFunction,
+    optimizer: nnx.Optimizer,
+    samples: Electron,
+    nuclei: Nucleus,
+    key: Key,
+    *,
+    batch_size: int = 100,
+    lambda_virial: float = 1e-3,
+) -> Array:
 
     @nnx.scan(
         in_axes=(None, nnx.Carry, 0, 0),
         out_axes=nnx.Carry,
     )
     def process_batch(wave_function: WaveFunction, carry, batch_samples: Electron, batch_key):
-        weighed_grads_sum, local_energy_sum, grads_sum, hamiltonian_details_sum, log_psi_sum = carry
+        weighed_grads_sum, local_energy_sum, loss_term_sum, grads_sum, hamiltonian_details_sum, log_psi_sum = carry
         keys = jax.random.split(batch_key, batch_samples.position.shape[0])
 
         local_energies, log_grads, hamiltonian_details, log_psi = nnx.vmap(local_energy, in_axes=(None, 0, None, 0))(wave_function, batch_samples, nuclei, keys)
-        hamiltonian_details = jax.tree.map(partial(jnp.sum, axis=0), hamiltonian_details)
+
+        # The introduced penalty terms is to:
+        #  1. keep 2T+V=0 (virial theorem)
+        #  2. keep the orbitals orthonormal
+        virial_penalty = jnp.square(2 * hamiltonian_details.kinetic_energy + hamiltonian_details.potential_energy)
+        penalty_terms = lambda_virial * virial_penalty # + lambda_ortho * orthonormality_measure
+
+        loss_terms = local_energies + penalty_terms
 
         weighed_grads_sum = jax.tree.map(
-            lambda loss_gradient, acc: acc + jnp.sum(jnp.expand_dims(local_energies, axis=tuple(range(1, loss_gradient.ndim))) * loss_gradient, axis=0),
+            lambda loss_gradient, acc: acc + jnp.sum(jnp.expand_dims(loss_terms, axis=tuple(range(1, loss_gradient.ndim))) * loss_gradient, axis=0),
             log_grads, weighed_grads_sum
         )
 
@@ -882,10 +958,11 @@ def optimize_wave_function_batched(wave_function: WaveFunction, optimizer: nnx.O
         )
 
         local_energy_sum = local_energy_sum + jnp.sum(local_energies, axis=0)
-        hamiltonian_details_sum = jax.tree.map(lambda x, acc: acc + x, hamiltonian_details, hamiltonian_details_sum)
+        loss_term_sum = loss_term_sum + jnp.sum(loss_terms, axis=0)
+        hamiltonian_details_sum = jax.tree.map(lambda x, acc: acc + jnp.sum(x, axis=0), hamiltonian_details, hamiltonian_details_sum)
         log_psi_sum = log_psi_sum + jnp.sum(log_psi, axis=0)
 
-        return weighed_grads_sum, local_energy_sum, grads_sum, hamiltonian_details_sum, log_psi_sum
+        return weighed_grads_sum, local_energy_sum, loss_term_sum, grads_sum, hamiltonian_details_sum, log_psi_sum
 
 
     # Construct accumulators
@@ -904,22 +981,23 @@ def optimize_wave_function_batched(wave_function: WaveFunction, optimizer: nnx.O
 
     # Compute the batches sequentially
     batch_keys = jax.random.split(key, num_batches)
-    weighed_grads_sum, local_energy_sum, grads_sum, hamiltonian_details_sum, log_psi_sum = process_batch(
-        wave_function, (init_weighed_grads, 0.0, init_grads, init_hamiltonian_details, 0.0), batch_samples, batch_keys
+    weighed_grads_sum, local_energy_sum, loss_term_sum, grads_sum, hamiltonian_details_sum, log_psi_sum = process_batch(
+        wave_function, (init_weighed_grads, 0.0, 0.0, init_grads, init_hamiltonian_details, 0.0), batch_samples, batch_keys
     )
 
     # Compute the mean loss grads by using linearity of expectations:
-    #   E[(E_L - <E_L>) * log_grads] = E[E_L * log_grads] - <E_L> * E[log_grads]
+    #   E[((E_L - <E_L>) + penalty_terms) * log_grads] = E[E_L * log_grads] - <E_L> * E[log_grads]
     # Then because we take the sum, we get the average by dividing by the number of samples
-    avg_energy = local_energy_sum / num_samples
+    avg_loss_term = loss_term_sum / num_samples
     mean_loss_grads = jax.tree.map(
-        lambda w, g: (w / num_samples) - avg_energy * (g / num_samples),
-        weighed_grads_sum, grads_sum
+        lambda w, g: (w / num_samples) - avg_loss_term * (g / num_samples),
+        weighed_grads_sum, grads_sum,
     )
     hamiltonian_details = jax.tree.map(lambda x: x / num_samples, hamiltonian_details_sum)
     log_psi = log_psi_sum / num_samples
     optimizer.update(mean_loss_grads)
 
+    avg_energy = local_energy_sum / num_samples
     return avg_energy, hamiltonian_details, log_psi
 
 optimize_wave_function = optimize_wave_function_batched
