@@ -12,7 +12,7 @@ from .utils import Nucleus
 
 def main(_args):
     ### 1 Oxygen and 2 Hydrogen nuclei (H_2O)
-    nuclei_positions = jnp.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]], dtype=jnp.float32)
+    nuclei_positions = jnp.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.6], [0.0, 0.0, -1.6]], dtype=jnp.float32)
     nuclei_charges = jnp.array([8, 1, 1], dtype=jnp.int32)
     nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
 
@@ -31,12 +31,12 @@ def main(_args):
     electronic_optimizer = nnx.ModelAndOptimizer(
         wave_function,
         optax.chain(
-            optax.clip_by_global_norm(1.0),
+            optax.clip_by_global_norm(2.0),
             optax.adam(1e-3),
         )
     )
 
-    nuclei_optimizer = optax.adam(1e-2)
+    nuclei_optimizer = optax.sgd(1.0)
     nuclei_opt_state = nuclei_optimizer.init(nuclei.position)
 
     iterations = 100
@@ -47,10 +47,10 @@ def main(_args):
         print(f"Iteration {iteration + 1}/{iterations}")
         electronic_key, nuclei_key = jax.random.split(key)
 
-        electronic_steps = 50
-        nuclei_steps = 10
-        num_chains = 25
-        num_samples = 500
+        electronic_steps = 10
+        nuclei_steps = 1
+        num_chains = 50
+        num_samples = 1500
 
         train_wavefunction(
             wave_function,

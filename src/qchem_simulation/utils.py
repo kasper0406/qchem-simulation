@@ -67,7 +67,7 @@ class Nucleus:
     charge: Array
 
 
-def clip_grad(min_val, max_val):
+def clip_grad_elementwise(min_val, max_val):
     """
     Decorator factory to clip the gradients of a function.
 
@@ -78,30 +78,28 @@ def clip_grad(min_val, max_val):
     Returns:
         A decorator that can be applied to any JAX function.
     """
-    # This is the decorator that will be returned
     def decorator(fun):
-        # Create a function with a custom VJP
         @jax.custom_vjp
         def wrapped_fun(*args, **kwargs):
-            # The forward pass is just the original function
             return fun(*args, **kwargs)
 
-        # Define the forward pass for the custom VJP
         def wrapped_fun_fwd(*args, **kwargs):
-            # We need the original inputs for the backward pass to re-compute the VJP
-            # The output is (results, residuals_for_backward_pass)
-            return fun(*args, **kwargs), (args, kwargs)
+            # Unfortunately jax.linearize/linear_transpose does not work well with integer inputs
+            # y, jvp = jax.linearize(fun, *args, **kwargs)
+            # return y, (jvp, args, kwargs)
 
-        # Define the custom backward pass
+            y = fun(*args, **kwargs)
+            return y, (args, kwargs)
+
         def wrapped_fun_bwd(res, g):
-            args, kwargs = res  # Unpack the inputs from the forward pass
+            # Unfortunately jax.linearize/linear_transpose does not work well with integer inputs
+            # jvp, args, kwargs = res
+            # vjp = jax.linear_transpose(jvp, *args, **kwargs)
+            # grads = vjp(g)
 
-            # Get the VJP of the original function
-            # jax.vjp returns (primals_out, vjp_fn)
+            args, kwargs = res
             _, vjp_fn = jax.vjp(fun, *args, **kwargs)
-
-            # Compute the original gradients
-            original_grads = vjp_fn(g)
+            grads = vjp_fn(g)
 
             # Clip the gradients. jax.tree_util.tree_map handles pytrees
             # (e.g., tuples/lists of gradients for multiple arguments).
@@ -110,13 +108,61 @@ def clip_grad(min_val, max_val):
                     # A float0 array will not be clipped
                     return grad
                 return jnp.clip(grad, min_val, max_val)
-            clipped_grads = jax.tree_util.tree_map(clipper, original_grads)
+            clipped_grads = jax.tree_util.tree_map(clipper, grads)
 
             return clipped_grads
 
-        # Set the custom VJP for our wrapped function
         wrapped_fun.defvjp(wrapped_fun_fwd, wrapped_fun_bwd)
+        return wrapped_fun
 
+    return decorator
+
+
+def clip_by_global_norm(grads, max_norm: float, eps: float = 1e-9):
+    def _tree_l2_sq(tree):
+        def leaf_sq(x):
+            if getattr(x, 'dtype', None) == jax.dtypes.float0:
+                return 0.0
+            return jnp.sum(jnp.square(x))
+        leaves = jax.tree_util.tree_leaves(tree)
+        return sum(leaf_sq(x) for x in leaves) if leaves else 0.0
+
+    l2_sq = _tree_l2_sq(grads)
+    global_norm = jnp.sqrt(l2_sq)
+    scale = jnp.minimum(1.0, max_norm / (global_norm + eps))
+    return jax.tree_util.tree_map(
+        lambda g: g if getattr(g, 'dtype', None) == jax.dtypes.float0 else g * scale,
+        grads,
+    )
+
+def clip_grad_global(max_norm: float, eps: float = 1e-9):
+    def decorator(fun):
+        @jax.custom_vjp
+        def wrapped_fun(*args, **kwargs):
+            return fun(*args, **kwargs)
+
+        def wrapped_fun_fwd(*args, **kwargs):
+            # Unfortunately jax.linearize/linear_transpose does not work well with integer inputs
+            # y, jvp = jax.linearize(fun, *args, **kwargs)
+            # return y, (jvp, args, kwargs)
+
+            y = fun(*args, **kwargs)
+            return y, (args, kwargs)
+
+        def wrapped_fun_bwd(res, g):
+            # Unfortunately jax.linearize/linear_transpose does not work well with integer inputs
+            # jvp, args, kwargs = res
+            # vjp = jax.linear_transpose(jvp, *args, **kwargs)
+            # grads = vjp(g)
+
+            args, kwargs = res
+            _, vjp_fn = jax.vjp(fun, *args, **kwargs)
+            grads = vjp_fn(g)
+
+            clipped_grads = clip_by_global_norm(grads, max_norm, eps)
+            return clipped_grads
+
+        wrapped_fun.defvjp(wrapped_fun_fwd, wrapped_fun_bwd)
         return wrapped_fun
 
     return decorator

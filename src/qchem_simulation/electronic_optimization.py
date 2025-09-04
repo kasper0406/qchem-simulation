@@ -9,7 +9,7 @@ import einops
 from functools import partial
 import plotly.graph_objects as go
 import optax
-from .utils import Electron, Nucleus, clip_grad, reduce_vmap
+from .utils import Electron, Nucleus, clip_grad_elementwise, clip_grad_global, reduce_vmap
 import chex
 
 
@@ -288,6 +288,10 @@ def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_hal
         distances = jnp.reshape(distances[upper_indices], (-1, ))
         square_distances = jnp.reshape(square_distances[upper_indices], (-1, ))
 
+        # Notice the unit vectors will only keep one direction per pair of particles
+        # when the upper half is selected
+        unit_vectors = jnp.reshape(unit_vectors[upper_indices], (-1, 3))
+
     return Distance(
         magnitude=distances,
         direction=unit_vectors,
@@ -348,28 +352,35 @@ class DistanceEncoder(nnx.Module):
         return distance_encoding
 
 
+class FlatDistanceEncoder(nnx.Module):
+    """
+    Use the ordinary DistanceEncoder, but we expect the argument to be a flat array of distances.
+    We will add an initial dimension to make it compatible with the DistanceEncoder.
+    """
+
+    def __init__(self, hidden_dim: int, buckets: int, rngs: nnx.Rngs, cutoff: float = 10.0):
+        self.encoder = DistanceEncoder(hidden_dim, buckets, rngs, cutoff)
+
+    def __call__(self, distances: Distance):
+        expanded = jax.tree.map(lambda x: x[None, :], distances)
+        return self.encoder(expanded)[0]
+
+
 @dataclass
 class DistanceEncoders(nnx.Object):
     electron: DistanceEncoder
     electron_nuclei: DistanceEncoder
-    # nuclei: DistanceEncoder
+    nuclei: FlatDistanceEncoder
 
 
 class ElectronicAttention(nnx.Module):
     def __init__(self, hdim: int, num_electrons: int, num_nuclei: int, rngs: nnx.Rngs):
-        # Set up the nuclei-nuclei distance encoder
-        self.nuclei_distance_encoder = None
-        nuclei_pairs = num_nuclei * (num_nuclei - 1) // 2
-        if nuclei_pairs > 0:
-            self.nuclei_distance_encoder = nnx.Linear(nuclei_pairs, hdim, rngs=rngs)
-
         self.transformer = TransformerStack(
             num_layers=4,
             num_heads=2,
             hidden_dim=hdim,
             rngs=rngs,
         )
-        # self.down_project = nnx.Linear(hdim, num_electrons, rngs=rngs)
 
     def __call__(self, distances: Distances, distance_encoders: DistanceEncoders, extra_features: Array | None = None) -> Array:
         # print("Electron distances:", distances.electron_distances.shape)
@@ -382,13 +393,11 @@ class ElectronicAttention(nnx.Module):
         electron_distance_embedding = distance_encoders.electron(distances.electron_distances)
         electron_nuclei_distance_embedding = distance_encoders.electron_nuclei(distances.electron_nuclei_distances)
 
-        distance_embedding = electron_distance_embedding + electron_nuclei_distance_embedding
-        print(f"Distance embedding shape: {distance_embedding.shape}")
+        # The nuclei distance embedding is broadcasted over all electrons
+        nuclei_distance_embedding = distance_encoders.nuclei(distances.nuclei_distances)[None, :]
 
-        if self.nuclei_distance_encoder is not None:
-            # TODO(knielsen): Handle this with a proper distance encoder
-            nucleus_distance_embedding = self.nuclei_distance_encoder(distances.nuclei_distances.magnitude)
-            distance_embedding = distance_embedding + nucleus_distance_embedding[None, :]
+        distance_embedding = electron_distance_embedding + electron_nuclei_distance_embedding + nuclei_distance_embedding
+        print(f"Distance embedding shape: {distance_embedding.shape}")
 
         combined_embedding = distance_embedding
         if extra_features is not None:
@@ -402,11 +411,6 @@ class ElectronicAttention(nnx.Module):
         # attention_output = self.transformer(combined_embedding, electron_distance_embedding)
 
         return attention_output
-
-        # # Produce a (num_electrons, num_electrons) array
-        # # It will have the feature that swapping an electron position i with j, will switch the
-        # # output rows.
-        # return self.down_project(attention_output)
 
 
 class OrbitalHead(nnx.Module):
@@ -588,7 +592,8 @@ class WaveFunction(nnx.Module):
         hidden_dim = 64
         self.distance_encoders = DistanceEncoders(
             electron=DistanceEncoder(hidden_dim, buckets=64, rngs=rngs),
-            electron_nuclei=DistanceEncoder(hidden_dim, buckets=64, rngs=rngs)
+            electron_nuclei=DistanceEncoder(hidden_dim, buckets=64, rngs=rngs),
+            nuclei=FlatDistanceEncoder(hidden_dim, buckets=64, rngs=rngs),
         )
 
         self.jastrow_factor = JastrowFactor(num_electrons=num_electrons, num_nuclei=num_nuclei, hdim=hidden_dim, rngs=rngs)
@@ -717,7 +722,8 @@ def setup_sampler(
 
     # The gradient of the wave-functions tends to infinity around the cusps and nodes.
     # Clip the gradient during sampling to make it more stable.
-    @clip_grad(-1.0, 1.0)
+    # @clip_grad_elementwise(-1.0, 1.0)
+    @clip_grad_global(max_norm=1.0)
     def clipped_logdensity_fn(electron_positions: Array):
         return logdensity_fn(electron_positions)
 
@@ -731,10 +737,10 @@ def setup_sampler(
     #     optim,
     #     warmup_steps,
     # )
-    # kernel = jax.vmap(blackjax.dynamic_hmc(logdensity_fn, **parameters).step, axis_size=num_chains)
+    # kernel = jax.vmap(blackjax.dynamic_hmc(clipped_logdensity_fn, **parameters).step, axis_size=num_chains)
 
 
-    mala = blackjax.mala(clipped_logdensity_fn, step_size=0.005)
+    mala = blackjax.mala(clipped_logdensity_fn, step_size=0.002)
     chain_state = jax.vmap(mala.init)(initial_positions.position)
     kernel = jax.vmap(mala.step, axis_size=num_chains)
 

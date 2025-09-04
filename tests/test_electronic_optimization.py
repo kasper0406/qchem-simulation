@@ -5,15 +5,17 @@ import pytest
 from flax import nnx
 from jaxtyping import Array
 
-from qchem_simulation.electronic_optimization import DistanceEncoders, ElectronicAttention, SlaterDeterminant, DistanceEncoder, calculate_distances
+from qchem_simulation.electronic_optimization import DistanceEncoders, FlatDistanceEncoder, ElectronicAttention, SlaterDeterminant, DistanceEncoder, calculate_distances
 
 
 def _create_distance_encoders(hdim: int, rngs: nnx.Rngs) -> DistanceEncoders:
     electron_distance_encoder = DistanceEncoder(hdim, buckets=32, rngs=rngs)
     electron_nuclei_distance_encoder = DistanceEncoder(hdim, buckets=32, rngs=rngs)
+    nuclei_distance_encoder = FlatDistanceEncoder(hdim, buckets=32, rngs=rngs)
     return DistanceEncoders(
         electron=electron_distance_encoder,
-        electron_nuclei=electron_nuclei_distance_encoder
+        electron_nuclei=electron_nuclei_distance_encoder,
+        nuclei=nuclei_distance_encoder
     )
 
 

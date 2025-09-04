@@ -3,14 +3,15 @@ import jax.numpy as jnp
 import optax
 from jaxtyping import Array, Key
 from flax import nnx
-from .utils import Nucleus, Electron, reduce_vmap, clip_grad
+from .utils import Nucleus, Electron, reduce_vmap, clip_grad_elementwise, clip_grad_global
 from .electronic_optimization import WaveFunction, sample_from_wavefunction, hamiltonian
 import einops
 from functools import partial
 
 
-def force_func(wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
-    @clip_grad(-1.0, 1.0)
+def nuclei_energy_grad(wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
+    # @clip_grad_elementwise(-1.0, 1.0)
+    @clip_grad_global(max_norm=1.0)
     def hamiltonian_grad(
         nuclei_positions: Array,  # Gradient wrt. nuclei positions
         wave_func_graphdef: WaveFunction,
@@ -24,9 +25,9 @@ def force_func(wave_function: WaveFunction, electron_samples: Electron, nuclei: 
         energy, _details = hamiltonian(wave_function, electron_sample, nuclei, key)
         return energy
 
-    zero_forces = jnp.zeros_like(nuclei.position)
-    @reduce_vmap(in_axes=(None, 0, None, None, 0), out_axes=0, init=zero_forces, reduce_fn=jnp.sum, acc_fn=jnp.add, batch_size=100)
-    def forces_fn(
+    zero_grads = jnp.zeros_like(nuclei.position)
+    @reduce_vmap(in_axes=(None, 0, None, None, 0), out_axes=0, init=zero_grads, reduce_fn=jnp.sum, acc_fn=jnp.add, batch_size=100)
+    def energy_grad(
         wave_function: WaveFunction,
         electron_sample: Electron,
         nuclei_positions: Array,
@@ -34,16 +35,15 @@ def force_func(wave_function: WaveFunction, electron_samples: Electron, nuclei: 
         key: Key
     ) -> Array:
         wave_func_graphdef, wave_func_state = nnx.split(wave_function)
-        forces_fn = jax.grad(hamiltonian_grad)
+        energy_grad_fn = jax.grad(hamiltonian_grad)
         # print(f"Nuclei positions: {nuclei_positions}")
-        forces = forces_fn(nuclei_positions, wave_func_graphdef, wave_func_state, electron_sample, nuclei_charges, key)
-        # print(f"Forces: {forces}")
-        return forces
+        energy_grad = energy_grad_fn(nuclei_positions, wave_func_graphdef, wave_func_state, electron_sample, nuclei_charges, key)
+        return energy_grad
 
     hamiltonian_keys = jax.random.split(key, electron_samples.position.shape[0])
     # Differentiate wrt nuclei_positions
-    forces = forces_fn(wave_function, electron_samples, nuclei.position, nuclei.charge, hamiltonian_keys)
-    return forces / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean force divide by the number of samples
+    grad = energy_grad(wave_function, electron_samples, nuclei.position, nuclei.charge, hamiltonian_keys)
+    return grad / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean force divide by the number of samples
 
 
 @nnx.jit(static_argnames=["num_electron_samples", "num_electron_chains", "sum_of_charges", "optimizer"])
@@ -57,7 +57,7 @@ def sample_and_optimize(
     sum_of_charges: int,
     key: Key,
 ):
-    sample_key, force_key = jax.random.split(key, 2)
+    sample_key, grad_key = jax.random.split(key, 2)
 
     electron_samples, _log_densities, _chain_state, _acceptance_rate = sample_from_wavefunction(
         wave_function=wave_function,
@@ -69,9 +69,9 @@ def sample_and_optimize(
     )
     electron_samples = jax.tree.map(lambda x: einops.rearrange(x, "n c ... -> (n c) ..."), electron_samples)
 
-    forces = force_func(wave_function, electron_samples, nuclei, force_key)
+    nuclei_grads = nuclei_energy_grad(wave_function, electron_samples, nuclei, grad_key)
 
-    updates, opt_state = optimizer.update(forces, opt_state, nuclei.position)
+    updates, opt_state = optimizer.update(nuclei_grads, opt_state, nuclei.position)
     new_position = optax.apply_updates(nuclei.position, updates)
     new_nuclei = Nucleus(position=new_position, charge=nuclei.charge)
 
