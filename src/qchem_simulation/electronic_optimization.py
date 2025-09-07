@@ -391,7 +391,7 @@ class DistanceEncoder(nnx.Module):
         down_projected = self.feature_down_proj(activated)
         attended = self.feature_attn(down_projected)
 
-        pooled_attention = jnp.sum(attended, axis=1)  # Mean to make sure the distance encoding will be permutation equivalent
+        pooled_attention = jnp.mean(attended, axis=1)  # Mean to make sure the distance encoding will be permutation equivalent
         distance_encoding = self.final_proj(pooled_attention)
 
         chex.assert_shape(distance_encoding, (None, self.final_proj.out_features))
@@ -698,7 +698,7 @@ def init_electrons(nuclei: Nucleus, num_chains: int, rng: Key, sum_of_charges: i
     """
     # Repeat the nuclei positions according to their charges
     num_electrons = sum_of_charges
-    positions = jnp.repeat(nuclei.position, nuclei.charge, axis=0, total_repeat_length=num_electrons)
+    positions = jnp.repeat(nuclei.position, nuclei.charge.astype(jnp.int32), axis=0, total_repeat_length=num_electrons)
 
     # Split the random key for position and spin generation.
     pos_rng, spin_rng = jax.random.split(rng)
@@ -708,7 +708,7 @@ def init_electrons(nuclei: Nucleus, num_chains: int, rng: Key, sum_of_charges: i
     positions = jnp.expand_dims(positions, axis=0) + jax.random.normal(pos_rng, shape=(num_chains, num_electrons, 3))
 
     # For now the spins are not being changed in the MCMC walk, we will initialize it to -1, 1 in an alternating way
-    spins = jnp.tile(((-1) ** jnp.arange(num_electrons))[None, :, None], (num_chains, 1, 1))
+    spins = jnp.tile(((-1.0) ** jnp.arange(num_electrons))[None, :, None], (num_chains, 1, 1))
     # Generate random spins for each electron in each chain.
     # spins = jax.random.choice(spin_rng, jnp.array([-1, 1]), shape=(num_chains, num_electrons))
 
@@ -754,8 +754,8 @@ def setup_sampler(
 
     logdensity_fn = partial(call_wavefunction_wrapper,
                             electron_spins=initial_positions.spin[0],
-                            nuclei=nuclei,
                             graphdef=graphdef,
+                            nuclei=nuclei,
                             state=state
                             )
 
@@ -771,7 +771,7 @@ def setup_sampler(
     # Clip the gradient during sampling to make it more stable.
     # @clip_grad_elementwise(-1.0, 1.0)
     @clip_grad_global(max_norm=1.0)
-    def clipped_logdensity_fn(electron_positions: Array):
+    def clipped_logdensity_fn(electron_positions: Array) -> Array:
         return logdensity_fn(electron_positions)
 
 

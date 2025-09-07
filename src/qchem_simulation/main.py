@@ -4,17 +4,27 @@ import jax.numpy as jnp
 from flax import nnx
 import optax
 import os
+from jaxtyping import Array, Key
 
 from .electronic_optimization import WaveFunction, train_wavefunction
 from .nuclei_optimization import optimize_nuclei
 from .utils import Nucleus
 
 
+def jiggle_nuclei(nuclei_positions: Array, key: Key, scale: float = 1e-2):
+    noise = jax.random.normal(key, nuclei_positions.shape) * scale
+    return nuclei_positions + noise
+
+
 def main(_args):
+    main_key = jax.random.key(0)
+
+    optimization_key, jiggle_key = jax.random.split(main_key, 2)
+
     ### 1 Oxygen and 2 Hydrogen nuclei (H_2O)
-    nuclei_positions = jnp.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.6], [0.0, 0.0, -1.6]], dtype=jnp.float32)
-    nuclei_charges = jnp.array([8, 1, 1], dtype=jnp.int32)
-    nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
+    nuclei_positions = jnp.array([[0.0, 1.6, 0.0], [0.0, 0.0, 1.6], [0.0, 0.0, -1.6]], dtype=jnp.float32)
+    nuclei_charges = jnp.array([8, 1, 1], dtype=jnp.float32)
+    nuclei = Nucleus(position=jiggle_nuclei(nuclei_positions, jiggle_key), charge=nuclei_charges)
 
     # Initialize the wave function
     num_electrons = int(jnp.sum(nuclei.charge))
@@ -36,28 +46,28 @@ def main(_args):
         )
     )
 
-    nuclei_optimizer = optax.adam(1e-2)
+    # nuclei_optimizer = optax.adam(1e-2)
+    nuclei_optimizer = optax.sgd(0.1)
     nuclei_opt_state = nuclei_optimizer.init(nuclei.position)
 
     iterations = 100
-
-    main_key = jax.random.key(0)
-    iteration_keys = jax.random.split(main_key, iterations)
+    iteration_keys = jax.random.split(optimization_key, iterations)
     for iteration, key in enumerate(iteration_keys):
         print(f"Iteration {iteration + 1}/{iterations}")
         electronic_key, nuclei_key = jax.random.split(key)
 
-        electronic_steps = 10
+        electronic_steps = 50  # 100
         nuclei_steps = 1
-        num_chains = 15
-        num_samples = 500
+        num_chains = 50
+        num_electronic_samples = 500
+        num_nuclei_samples = 2_000
 
         train_wavefunction(
             wave_function,
             electronic_optimizer,
             nuclei,
             num_steps=electronic_steps,
-            num_samples=num_samples,
+            num_samples=num_electronic_samples,
             num_chains=num_chains,
             key=electronic_key
         )
@@ -68,7 +78,7 @@ def main(_args):
             nuclei_opt_state,
             nuclei_steps,
             nuclei,
-            num_electron_samples=num_samples,
+            num_electron_samples=num_nuclei_samples,
             num_electron_chains=num_chains,
             key=nuclei_key,
         )

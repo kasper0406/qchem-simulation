@@ -85,21 +85,21 @@ def clip_grad_elementwise(min_val, max_val):
 
         def wrapped_fun_fwd(*args, **kwargs):
             # Unfortunately jax.linearize/linear_transpose does not work well with integer inputs
-            # y, jvp = jax.linearize(fun, *args, **kwargs)
-            # return y, (jvp, args, kwargs)
+            y, jvp = jax.linearize(fun, *args, **kwargs)
+            return y, (jvp, args, kwargs)
 
-            y = fun(*args, **kwargs)
-            return y, (args, kwargs)
+            # y = fun(*args, **kwargs)
+            # return y, (args, kwargs)
 
         def wrapped_fun_bwd(res, g):
             # Unfortunately jax.linearize/linear_transpose does not work well with integer inputs
-            # jvp, args, kwargs = res
-            # vjp = jax.linear_transpose(jvp, *args, **kwargs)
-            # grads = vjp(g)
+            jvp, args, kwargs = res
+            vjp = jax.linear_transpose(jvp, *args, **kwargs)
+            grads = vjp(g)
 
-            args, kwargs = res
-            _, vjp_fn = jax.vjp(fun, *args, **kwargs)
-            grads = vjp_fn(g)
+            # args, kwargs = res
+            # _, vjp_fn = jax.vjp(fun, *args, **kwargs)
+            # grads = vjp_fn(g)
 
             # Clip the gradients. jax.tree_util.tree_map handles pytrees
             # (e.g., tuples/lists of gradients for multiple arguments).
@@ -143,21 +143,21 @@ def clip_grad_global(max_norm: float, eps: float = 1e-9):
 
         def wrapped_fun_fwd(*args, **kwargs):
             # Unfortunately jax.linearize/linear_transpose does not work well with integer inputs
-            # y, jvp = jax.linearize(fun, *args, **kwargs)
-            # return y, (jvp, args, kwargs)
+            y, jvp = jax.linearize(fun, *args, **kwargs)
+            return y, (jvp, args, kwargs)
 
-            y = fun(*args, **kwargs)
-            return y, (args, kwargs)
+            # y = fun(*args, **kwargs)
+            # return y, (args, kwargs)
 
         def wrapped_fun_bwd(res, g):
             # Unfortunately jax.linearize/linear_transpose does not work well with integer inputs
-            # jvp, args, kwargs = res
-            # vjp = jax.linear_transpose(jvp, *args, **kwargs)
-            # grads = vjp(g)
+            jvp, args, kwargs = res
+            vjp = jax.linear_transpose(jvp, *args, **kwargs)
+            grads = vjp(g)
 
-            args, kwargs = res
-            _, vjp_fn = jax.vjp(fun, *args, **kwargs)
-            grads = vjp_fn(g)
+            # args, kwargs = res
+            # _, vjp_fn = jax.vjp(fun, *args, **kwargs)
+            # grads = vjp_fn(g)
 
             clipped_grads = clip_by_global_norm(grads, max_norm, eps)
             return clipped_grads

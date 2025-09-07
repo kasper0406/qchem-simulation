@@ -9,7 +9,7 @@ import einops
 from functools import partial
 
 
-def nuclei_energy_grad(wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
+def nuclei_energy_grad_full(wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
     # @clip_grad_elementwise(-1.0, 1.0)
     @clip_grad_global(max_norm=10.0)
     def hamiltonian_grad(
@@ -46,9 +46,60 @@ def nuclei_energy_grad(wave_function: WaveFunction, electron_samples: Electron, 
     return grad / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean force divide by the number of samples
 
 
-def jiggle_nuclei(nuclei_positions: Array, key: Key, scale: float = 1e-2):
-    noise = jax.random.normal(key, nuclei_positions.shape) * scale
-    return nuclei_positions + noise
+def nuclei_energy_grad_hellmann_feynman(_wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
+    """
+    According to the Hellmann-Feynman theorem (https://en.wikipedia.org/wiki/Hellmann–Feynman_theorem),
+    the force on the nuclei can be calculated only considering the classical columb forces between the nuclei and the electrons,
+    and between the nuclei themselves.
+
+    Notice, the wave_function itself is not used directly, but it is implicitly used to generate the electron_samples.
+    It (along with the key) is kept in the function signature to be consistent with nuclei_energy_grad_full.
+    """
+    def simplified_hamiltonian(electrons: Electron, nuclei: Nucleus):
+        """
+        For a given state |psi> computes: H|psi> / psi (the local energy).
+        """
+        eps = 1e-12
+
+        nuclea_i, nuclea_j = jnp.triu_indices(nuclei.position.shape[0], k=1)
+        nuclei_charge = nuclei.charge[nuclea_i] * nuclei.charge[nuclea_j]
+        nuclei_distances = jnp.linalg.norm(nuclei.position[nuclea_i] - nuclei.position[nuclea_j], axis=-1)
+        nuclea_interaction = jnp.sum(nuclei_charge / (nuclei_distances + eps))
+
+        electron_nuclei_distances = jnp.linalg.norm(
+            electrons.position[:, None] - nuclei.position[None, :], axis=-1
+        )
+        nucleus_electron_interaction = -jnp.sum(nuclei.charge[None, :] / (electron_nuclei_distances + eps))
+
+        return nucleus_electron_interaction + nuclea_interaction
+
+    @clip_grad_global(max_norm=10.0)
+    def hamiltonian_grad(
+        nuclei_positions: Array,  # Gradient wrt. nuclei positions
+        electron_sample: Electron,
+        nuclei_charges: Array,
+    ):
+        nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
+        energy= simplified_hamiltonian(electron_sample, nuclei)
+        return energy
+
+    zero_grads = jnp.zeros_like(nuclei.position)
+    @reduce_vmap(in_axes=(0, None, None), out_axes=0, init=zero_grads, reduce_fn=jnp.sum, acc_fn=jnp.add, batch_size=100)
+    def energy_grad(
+        electron_sample: Electron,
+        nuclei_positions: Array,
+        nuclei_charges: Array,
+    ) -> Array:
+        energy_grad_fn = jax.grad(hamiltonian_grad)
+        print(f"Nuclei positions: {nuclei_positions}")
+        print(f"Nuclei charges: {nuclei_charges}")
+        print(f"Electron samples: {electron_sample}")
+        energy_grad = energy_grad_fn(nuclei_positions, electron_sample, nuclei_charges)
+        return energy_grad
+
+    # Differentiate wrt nuclei_positions
+    grad = energy_grad(electron_samples, nuclei.position, nuclei.charge)
+    return grad / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean force divide by the number of samples
 
 
 @nnx.jit(static_argnames=["num_electron_samples", "num_electron_chains", "sum_of_charges", "optimizer"])
@@ -62,7 +113,7 @@ def sample_and_optimize(
     sum_of_charges: int,
     key: Key,
 ):
-    sample_key, grad_key, jiggle_key = jax.random.split(key, 3)
+    sample_key, grad_key = jax.random.split(key, 2)
 
     electron_samples, _log_densities, _chain_state, _acceptance_rate = sample_from_wavefunction(
         wave_function=wave_function,
@@ -74,12 +125,10 @@ def sample_and_optimize(
     )
     electron_samples = jax.tree.map(lambda x: einops.rearrange(x, "n c ... -> (n c) ..."), electron_samples)
 
-    nuclei_grads = nuclei_energy_grad(wave_function, electron_samples, nuclei, grad_key)
+    nuclei_grads = nuclei_energy_grad_hellmann_feynman(wave_function, electron_samples, nuclei, grad_key)
 
     updates, opt_state = optimizer.update(nuclei_grads, opt_state, nuclei.position)
     new_position = optax.apply_updates(nuclei.position, updates)
-
-    new_position = jiggle_nuclei(new_position, jiggle_key)
 
     new_nuclei = Nucleus(position=new_position, charge=nuclei.charge)
 
