@@ -1,12 +1,14 @@
 from absl import app
+import einops
 import jax
 import jax.numpy as jnp
 from flax import nnx
 import optax
 import os
 from jaxtyping import Array, Key
+import plotly.graph_objects as go
 
-from .electronic_optimization import WaveFunction, train_wavefunction
+from .electronic_optimization import WaveFunction, train_wavefunction, sample_from_wavefunction
 from .nuclei_optimization import optimize_nuclei
 from .utils import Nucleus
 
@@ -14,6 +16,55 @@ from .utils import Nucleus
 def jiggle_nuclei(nuclei_positions: Array, key: Key, scale: float = 1e-2):
     noise = jax.random.normal(key, nuclei_positions.shape) * scale
     return nuclei_positions + noise
+
+
+def plot_nuclei_and_electrons(
+    step: int,
+    wave_function: WaveFunction,
+    num_electron_chains: int,
+    num_electron_samples: int,
+    nuclei: Nucleus,
+    key: Key
+):
+    sum_of_charges = int(jnp.sum(nuclei.charge))
+    electron_samples, _log_densities, _chain_state, _acceptance_rate = sample_from_wavefunction(
+        wave_function=wave_function,
+        nuclei=nuclei,
+        sum_of_charges=sum_of_charges,
+        key=key,
+        num_chains=num_electron_chains,
+        num_samples=num_electron_samples,
+    )
+    electron_samples = jax.tree.map(lambda x: einops.rearrange(x, "n c s ... -> (n c s) ..."), electron_samples)
+
+    electron_trace = go.Scatter3d(
+        x=electron_samples.position[:, 0],
+        y=electron_samples.position[:, 1],
+        z=electron_samples.position[:, 2],
+        mode='markers',
+        name='Electrons',
+        marker=dict(size=2, color='rgba(0,120,255,0.7)'),
+        hoverinfo='skip',
+    )
+
+    nuclei_trace = go.Scatter3d(
+        x=nuclei.position[:, 0],
+        y=nuclei.position[:, 1],
+        z=nuclei.position[:, 2],
+        mode='markers',
+        name='Nuclei',
+        marker=dict(size=6, color='crimson', symbol='diamond'),
+        customdata=nuclei.charge,
+        hovertemplate='Nucleus<br>Charge Z=%{customdata}<br>x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<extra></extra>',
+    )
+
+    fig = go.Figure(data=[electron_trace, nuclei_trace])
+    fig.update_layout(
+        scene=dict(xaxis_title='x', yaxis_title='y', zaxis_title='z', aspectmode='data'),
+        legend=dict(title='Molecule')
+    )
+    # fig.show(renderer="jupyterlab")
+    fig.write_html(f"electron_samples/step_{step}.html")
 
 
 def main(_args):
@@ -54,12 +105,12 @@ def main(_args):
     iteration_keys = jax.random.split(optimization_key, iterations)
     for iteration, key in enumerate(iteration_keys):
         print(f"Iteration {iteration + 1}/{iterations}")
-        electronic_key, nuclei_key = jax.random.split(key)
+        electronic_key, nuclei_key, plot_key = jax.random.split(key, num=3)
 
-        electronic_steps = 50  # 100
+        electronic_steps = 25  # 100
         nuclei_steps = 1
         num_chains = 50
-        num_electronic_samples = 500
+        num_electronic_samples = 1_000
         num_nuclei_samples = 2_000
 
         train_wavefunction(
@@ -81,6 +132,15 @@ def main(_args):
             num_electron_samples=num_nuclei_samples,
             num_electron_chains=num_chains,
             key=nuclei_key,
+        )
+
+        plot_nuclei_and_electrons(
+            step=iteration,
+            wave_function=wave_function,
+            num_electron_chains=num_chains,
+            num_electron_samples=num_nuclei_samples,
+            nuclei=nuclei,
+            key=plot_key,
         )
 
 

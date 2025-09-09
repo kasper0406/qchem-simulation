@@ -7,7 +7,6 @@ import blackjax
 from flax import nnx
 import einops
 from functools import partial
-import plotly.graph_objects as go
 import optax
 from .utils import Electron, Nucleus, clip_grad_elementwise, clip_grad_global, reduce_vmap
 import chex
@@ -705,7 +704,8 @@ def init_electrons(nuclei: Nucleus, num_chains: int, rng: Key, sum_of_charges: i
 
     # Generate random positions around the nuclei for each chain.
     # The positions are created with a shape of (num_chains, num_electrons, 3).
-    positions = jnp.expand_dims(positions, axis=0) + jax.random.normal(pos_rng, shape=(num_chains, num_electrons, 3))
+    sigma = 0.2  # Standard deviation for the normal distribution around each nucleus
+    positions = jnp.expand_dims(positions, axis=0) + sigma * jax.random.normal(pos_rng, shape=(num_chains, num_electrons, 3))
 
     # For now the spins are not being changed in the MCMC walk, we will initialize it to -1, 1 in an alternating way
     spins = jnp.tile(((-1.0) ** jnp.arange(num_electrons))[None, :, None], (num_chains, 1, 1))
@@ -814,6 +814,7 @@ def sample_from_wavefunction_using_sampler(chain_state, kernel, num_chains: int,
 
     return electron_position_samples, log_densities, chain_state, jnp.mean(acceptance_rate)
 
+@nnx.jit(static_argnames=["sum_of_charges", "num_chains", "num_samples", "warmup_steps", "mcmc_burnin_steps", "mcmc_thinning_factor"])
 def sample_from_wavefunction(
     wave_function: WaveFunction,
     nuclei: Nucleus,
@@ -822,8 +823,8 @@ def sample_from_wavefunction(
     num_chains: int,
     num_samples: int,
     warmup_steps: int = 100,
-    mcmc_burnin_steps: int = 100,
-    mcmc_thinning_factor: int = 2,
+    mcmc_burnin_steps: int = 200,
+    mcmc_thinning_factor: int = 4,
 ):
     init_electrons_key, init_sampler_key, sample_key = jax.random.split(key, 3)
 
@@ -1064,16 +1065,6 @@ def train_wavefunction(
             num_samples=int(num_samples),
             key=step_key,
         )
-
-        if step % 1000 == 0:
-            fig = go.Figure(data=[go.Scatter3d(
-                x=samples.position[:, 0],
-                y=samples.position[:, 1],
-                z=samples.position[:, 2],
-                mode='markers',
-                marker=dict(size=2),
-            )])
-            fig.show()
 
         print(f"Average energy step {step}: {avg_energy}")
         print(f"Hamiltonian details step {step}: {hamiltonian_details}")

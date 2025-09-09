@@ -7,6 +7,7 @@ from .utils import Nucleus, Electron, reduce_vmap, clip_grad_elementwise, clip_g
 from .electronic_optimization import WaveFunction, sample_from_wavefunction, hamiltonian
 import einops
 from functools import partial
+import plotly.graph_objects as go
 
 
 def nuclei_energy_grad_full(wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
@@ -123,7 +124,7 @@ def sample_and_optimize(
         num_chains=num_electron_chains,
         num_samples=num_electron_samples,
     )
-    electron_samples = jax.tree.map(lambda x: einops.rearrange(x, "n c ... -> (n c) ..."), electron_samples)
+    electron_samples = jax.tree.map(lambda x: einops.rearrange(x, "n c s ... -> (n c s) ..."), electron_samples)
 
     nuclei_grads = nuclei_energy_grad_hellmann_feynman(wave_function, electron_samples, nuclei, grad_key)
 
