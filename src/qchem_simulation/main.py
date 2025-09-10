@@ -27,7 +27,7 @@ def plot_nuclei_and_electrons(
     key: Key
 ):
     sum_of_charges = int(jnp.sum(nuclei.charge))
-    electron_samples, _log_densities, _chain_state, _acceptance_rate = sample_from_wavefunction(
+    electron_samples, _log_densities, _acceptance_rate = sample_from_wavefunction(
         wave_function=wave_function,
         nuclei=nuclei,
         sum_of_charges=sum_of_charges,
@@ -97,8 +97,8 @@ def main(_args):
         )
     )
 
-    # nuclei_optimizer = optax.adam(1e-2)
-    nuclei_optimizer = optax.sgd(0.1)
+    nuclei_optimizer = optax.adam(1e-3)
+    # nuclei_optimizer = optax.sgd(0.1)
     nuclei_opt_state = nuclei_optimizer.init(nuclei.position)
 
     iterations = 100
@@ -110,8 +110,8 @@ def main(_args):
         electronic_steps = 25  # 100
         nuclei_steps = 1
         num_chains = 50
-        num_electronic_samples = 1_000
-        num_nuclei_samples = 2_000
+        num_electronic_samples = 250
+        num_nuclei_samples = 650
 
         train_wavefunction(
             wave_function,

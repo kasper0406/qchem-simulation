@@ -116,7 +116,7 @@ def sample_and_optimize(
 ):
     sample_key, grad_key = jax.random.split(key, 2)
 
-    electron_samples, _log_densities, _chain_state, _acceptance_rate = sample_from_wavefunction(
+    electron_samples, _log_densities, _acceptance_rate = sample_from_wavefunction(
         wave_function=wave_function,
         nuclei=nuclei,
         sum_of_charges=sum_of_charges,
