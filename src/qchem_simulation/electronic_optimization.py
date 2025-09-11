@@ -117,7 +117,7 @@ class FeedForward(nnx.Module):
 
     def __call__(self, x: Array) -> Array:
         x = self.up_project(x)
-        x = nnx.glu(x)
+        x = jax.nn.glu(x)
         return self.down_project(x)
 
 
@@ -500,7 +500,6 @@ class JastrowFactor(nnx.Module):
         return electron_cusp + nuclei_cusp + corrections
 
 
-@jax.jit
 def slater_log_sum_exp(slater_logs, slater_signs, slater_coeffs):
     """
     Calculates the log-magnitude and sign of a wavefunction represented

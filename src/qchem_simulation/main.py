@@ -12,6 +12,8 @@ from .electronic_optimization import WaveFunction, train_wavefunction, sample_fr
 from .nuclei_optimization import optimize_nuclei
 from .utils import Nucleus
 
+from folx import register_function, wrap_forward_laplacian
+
 
 def jiggle_nuclei(nuclei_positions: Array, key: Key, scale: float = 1e-2):
     noise = jax.random.normal(key, nuclei_positions.shape) * scale
@@ -67,13 +69,20 @@ def plot_nuclei_and_electrons(
     fig.write_html(f"electron_samples/step_{step}.html")
 
 
+def register_special_folx_functions():
+    # Register special forward laplacian (folx) functions
+    register_function('glu', wrap_forward_laplacian(jax.nn.glu, in_axes=()))
+
+
 def main(_args):
+    register_special_folx_functions()
+
     main_key = jax.random.key(0)
 
     optimization_key, jiggle_key = jax.random.split(main_key, 2)
 
     ### 1 Oxygen and 2 Hydrogen nuclei (H_2O)
-    nuclei_positions = jnp.array([[0.0, 1.6, 0.0], [0.0, 0.0, 1.6], [0.0, 0.0, -1.6]], dtype=jnp.float32)
+    nuclei_positions = jnp.array([[0.0, 0.5, 0.0], [0.0, 0.0, 0.5], [0.0, 0.0, -0.5]], dtype=jnp.float32)
     nuclei_charges = jnp.array([8, 1, 1], dtype=jnp.float32)
     nuclei = Nucleus(position=jiggle_nuclei(nuclei_positions, jiggle_key), charge=nuclei_charges)
 
@@ -97,7 +106,7 @@ def main(_args):
         )
     )
 
-    nuclei_optimizer = optax.adam(1e-3)
+    nuclei_optimizer = optax.adam(5e-2)
     # nuclei_optimizer = optax.sgd(0.1)
     nuclei_opt_state = nuclei_optimizer.init(nuclei.position)
 
@@ -107,7 +116,7 @@ def main(_args):
         print(f"Iteration {iteration + 1}/{iterations}")
         electronic_key, nuclei_key, plot_key = jax.random.split(key, num=3)
 
-        electronic_steps = 25  # 100
+        electronic_steps = 25 # 100
         nuclei_steps = 1
         num_chains = 50
         num_electronic_samples = 250
@@ -123,6 +132,7 @@ def main(_args):
             key=electronic_key
         )
 
+        nuclei_before = nuclei
         nuclei, nuclei_opt_state = optimize_nuclei(
             wave_function,
             nuclei_optimizer,
@@ -139,7 +149,7 @@ def main(_args):
             wave_function=wave_function,
             num_electron_chains=num_chains,
             num_electron_samples=num_nuclei_samples,
-            nuclei=nuclei,
+            nuclei=nuclei_before,
             key=plot_key,
         )
 

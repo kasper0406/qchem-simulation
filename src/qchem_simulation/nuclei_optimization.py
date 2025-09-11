@@ -44,7 +44,7 @@ def nuclei_energy_grad_full(wave_function: WaveFunction, electron_samples: Elect
     hamiltonian_keys = jax.random.split(key, electron_samples.position.shape[0])
     # Differentiate wrt nuclei_positions
     grad = energy_grad(wave_function, electron_samples, nuclei.position, nuclei.charge, hamiltonian_keys)
-    return grad / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean force divide by the number of samples
+    return grad / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean energy gradient divide by the number of samples
 
 
 def nuclei_energy_grad_hellmann_feynman(_wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
@@ -100,7 +100,7 @@ def nuclei_energy_grad_hellmann_feynman(_wave_function: WaveFunction, electron_s
 
     # Differentiate wrt nuclei_positions
     grad = energy_grad(electron_samples, nuclei.position, nuclei.charge)
-    return grad / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean force divide by the number of samples
+    return grad / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean energy gradient divide by the number of samples
 
 
 @nnx.jit(static_argnames=["num_electron_samples", "num_electron_chains", "sum_of_charges", "optimizer"])
