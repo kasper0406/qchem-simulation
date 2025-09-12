@@ -69,16 +69,8 @@ def plot_nuclei_and_electrons(
     fig.write_html(f"electron_samples/step_{step}.html")
 
 
-def register_special_folx_functions():
-    # Register special forward laplacian (folx) functions
-    register_function('glu', wrap_forward_laplacian(jax.nn.glu, in_axes=()))
-
-
 def main(_args):
-    register_special_folx_functions()
-
     main_key = jax.random.key(0)
-
     optimization_key, jiggle_key = jax.random.split(main_key, 2)
 
     ### 1 Oxygen and 2 Hydrogen nuclei (H_2O)
@@ -94,7 +86,7 @@ def main(_args):
     wave_function = WaveFunction(
         num_electrons=num_electrons,
         num_nuclei=num_nuclei,
-        rngs=nnx.Rngs(0),
+        rngs=nnx.Rngs(1234),
     )
 
     # Start the wave function optimization

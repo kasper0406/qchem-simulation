@@ -231,10 +231,14 @@ def calculate_distances(electron_positions: Array, nucleus_positions: Array) -> 
     )
 
 
+class StaticValue(nnx.Variable):
+    pass
+
+
 class DistanceEncoder(nnx.Module):
     def __init__(self, hidden_dim: int, buckets: int, rngs: nnx.Rngs, cutoff: float = 10.0):
-        self.centers = jnp.linspace(0.0, cutoff, buckets)
-        self.sigma = (self.centers[1] -  self.centers[0]) * 1.5
+        self.centers = StaticValue(jnp.linspace(0.0, cutoff, buckets))
+        self.sigma = StaticValue((self.centers[1] -  self.centers[0]) * 1.5)
 
         self.rbf_proj = nnx.Linear(buckets, buckets, rngs=rngs)
         self.direction_proj = nnx.Linear(15, buckets, rngs=rngs)
@@ -245,57 +249,57 @@ class DistanceEncoder(nnx.Module):
 
         self.final_proj = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
 
-    @nnx.vmap(in_axes=(None, 0), out_axes=0)
-    def _rbf_encoding(self, magnitudes: Array):
-        """
-        Radial basis function (RBF) encoding for distance magnitudes.
-        """
-        chex.assert_shape(magnitudes, (None,))  # Expecting a 1D array of magnitudes
-        return jnp.exp(-0.5 * ((magnitudes[:, None] - self.centers[None, :]) / self.sigma) ** 2)
-
-    @nnx.vmap(in_axes=(None, 0), out_axes=0)
-    def _real_sh_L3(self, direction: Array):
-        chex.assert_shape(direction, (None, 3))  # Expecting a 3D unit vector
-        x, y, z = jnp.moveaxis(direction, -1, 0)
-
-        # l = 1 (dipoles)
-        c1 = 0.4886025119029199
-        Y1m1 = c1 * y
-        Y10  = c1 * z
-        Y11  = c1 * x
-
-        # l = 2 (quadrupoles)
-        Y2m2 = 1.0925484305920792 * x * y
-        Y2m1 = 1.0925484305920792 * y * z
-        Y20  = 0.31539156525252005 * (3.0 * z*z - 1.0)
-        Y21  = 1.0925484305920792 * x * z
-        Y22  = 0.5462742152960396 * (x*x - y*y)
-
-        # l = 3 (octupoles) – fully-normalized real SH
-        Y3m3 = 0.5900435899266435 * y * (3.0 * x*x - y*y)
-        Y3m2 = 2.890611442640554 * x * y * z
-        Y3m1 = 0.4570457994644658 * y * (5.0 * z*z - 1.0)
-        Y30  = 0.3731763325901154 * z * (5.0 * z*z - 3.0)
-        Y31  = 0.4570457994644658 * x * (5.0 * z*z - 1.0)
-        Y32  = 1.445305721320277 * z * (x*x - y*y)
-        Y33  = 0.5900435899266435 * x * (x*x - 3.0 * y*y)
-
-        parts = [
-            Y1m1, Y10, Y11,
-            Y2m2, Y2m1, Y20, Y21, Y22,
-            Y3m3, Y3m2, Y3m1, Y30, Y31, Y32, Y33
-        ]
-        stacked = jnp.stack(parts, axis=-1)
-        chex.assert_shape(stacked, (None, 15))
-
-        return stacked
-
     def __call__(self, distance: Distance):
         chex.assert_shape(distance.magnitude, (None, None))
         chex.assert_shape(distance.direction, (None, None, 3))
+    
+        def _rbf_encoding(magnitudes: Array):
+            """
+            Radial basis function (RBF) encoding for distance magnitudes.
+            """
+            chex.assert_shape(magnitudes, (None, None))  # Expecting a magnitude for every pair
+            diffs = (magnitudes[:, :, None] - self.centers[None, None, :]) / self.sigma
+            return jnp.exp(-0.5 * (diffs ** 2))
+        
+        @nnx.vmap
+        def _real_sh_L3(direction: Array):
+            chex.assert_shape(direction, (None, 3))  # Expecting a 3D unit vector
+            x, y, z = jnp.moveaxis(direction, -1, 0)
 
-        radial_features = self.rbf_proj(self._rbf_encoding(distance.magnitude))
-        direction_features = self.direction_proj(self._real_sh_L3(distance.direction))
+            # l = 1 (dipoles)
+            c1 = 0.4886025119029199
+            Y1m1 = c1 * y
+            Y10  = c1 * z
+            Y11  = c1 * x
+
+            # l = 2 (quadrupoles)
+            Y2m2 = 1.0925484305920792 * x * y
+            Y2m1 = 1.0925484305920792 * y * z
+            Y20  = 0.31539156525252005 * (3.0 * z*z - 1.0)
+            Y21  = 1.0925484305920792 * x * z
+            Y22  = 0.5462742152960396 * (x*x - y*y)
+
+            # l = 3 (octupoles) – fully-normalized real SH
+            Y3m3 = 0.5900435899266435 * y * (3.0 * x*x - y*y)
+            Y3m2 = 2.890611442640554 * x * y * z
+            Y3m1 = 0.4570457994644658 * y * (5.0 * z*z - 1.0)
+            Y30  = 0.3731763325901154 * z * (5.0 * z*z - 3.0)
+            Y31  = 0.4570457994644658 * x * (5.0 * z*z - 1.0)
+            Y32  = 1.445305721320277 * z * (x*x - y*y)
+            Y33  = 0.5900435899266435 * x * (x*x - 3.0 * y*y)
+
+            parts = [
+                Y1m1, Y10, Y11,
+                Y2m2, Y2m1, Y20, Y21, Y22,
+                Y3m3, Y3m2, Y3m1, Y30, Y31, Y32, Y33
+            ]
+            stacked = jnp.stack(parts, axis=-1)
+            chex.assert_shape(stacked, (None, 15))
+
+            return stacked
+
+        radial_features = self.rbf_proj(_rbf_encoding(distance.magnitude))
+        direction_features = self.direction_proj(_real_sh_L3(distance.direction))
         combined_features = jnp.concat([radial_features, direction_features], axis=-1)
 
         up_projected = self.feature_up_proj(combined_features)
@@ -557,11 +561,12 @@ class WaveFunction(nnx.Module):
         self.jastrow_factor = JastrowFactor(num_electrons=num_electrons, num_nuclei=num_nuclei, hdim=hidden_dim, rngs=rngs)
 
         num_slaters = num_nuclei
-        @nnx.split_rngs(splits=num_slaters)
-        @nnx.vmap(in_axes=(None, None, 0))
-        def create_slater_determinants(num_electrons: int, num_nuclei: int, rng: Key) -> SlaterDeterminant:
-            return SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rngs=rng)
-        self.slater_determinant = create_slater_determinants(num_electrons, num_nuclei, rngs)
+        # @nnx.split_rngs(splits=num_slaters)
+        # @nnx.vmap
+        # def create_slater_determinants(rng: Key) -> SlaterDeterminant:
+        #     return SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rngs=rng)
+        # self.slater_determinants = create_slater_determinants(rngs)
+        self.slater_determinants = [SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rngs=rngs) for _ in range(num_slaters)]
 
         self.slater_strengths = nnx.Param(jnp.ones((num_slaters,), dtype=jnp.float32))
 
@@ -573,11 +578,15 @@ class WaveFunction(nnx.Module):
 
         distances = calculate_distances(electrons.position, nuclei.position)
     
-        @nnx.vmap(in_axes=(0, None, None, None), out_axes=(0, 0, 0))
-        def calc_slater(slater: SlaterDeterminant, distances: Distances, spins: Array, distance_encoders: DistanceEncoders) -> Array:
-            return slater(distances, spins, distance_encoders=distance_encoders)
+        # @nnx.vmap(in_axes=(0, None, None, None), out_axes=(0, 0, 0))
+        # def calc_slater(slater: SlaterDeterminant, distances: Distances, spins: Array, distance_encoders: DistanceEncoders) -> Array:
+        #     return slater(distances, spins, distance_encoders=distance_encoders)
+        def calc_slater(slaters: List[SlaterDeterminant], distances: Distances, spins: Array, distance_encoders: DistanceEncoders) -> Array:
+            results = [slater(distances, spins, distance_encoders=distance_encoders) for slater in slaters]
+            slater_logs, slater_signs, orthonormality_measures = zip(*results)
+            return jnp.array(slater_logs), jnp.array(slater_signs), jnp.array(orthonormality_measures)
 
-        slater_logs, slater_signs, orthonormality_measures = calc_slater(self.slater_determinant, distances, electrons.spin, self.distance_encoders)
+        slater_logs, slater_signs, orthonormality_measures = calc_slater(self.slater_determinants, distances, electrons.spin, self.distance_encoders)
         slaters_sum, sign = slater_log_sum_exp(slater_logs, slater_signs, self.slater_strengths)
 
         result = self.jastrow_factor(distances, nuclei.charge, electrons.spin, self.distance_encoders) + slaters_sum
@@ -642,6 +651,68 @@ def walk_electrons(sigma: Array) -> Callable:
         # return Electron(position=new_positions, spin=new_spins)
 
     return propose
+    
+    
+# Code the actually do MCMC sampling
+def call_wavefunction_wrapper(
+    # The MCMC chain will move only the position of one electron at a time
+    proposed_position_i: Array, # Shape (3,)
+    electron_i: int,
+    electron_positions: Array, # Shape (num_electrons, 3)
+    *,
+    electron_spins: Array,
+    nuclei: Nucleus,
+    wave_function: WaveFunction,
+    num_electrons: int,
+) -> Array:
+    chex.assert_shape(proposed_position_i, (3,))
+    chex.assert_shape(electron_positions, (num_electrons, 3))
+
+    proposed_positions = electron_positions.at[electron_i].set(proposed_position_i)
+    # print(f"Electrons shape: {all_positions.shape}")
+
+    electrons = Electron(position=proposed_positions, spin=electron_spins)
+    log_psi, _sign, _ortho_measure = wave_function(electrons, nuclei)
+    # print(f"Wave function output shape: {log_psi.shape}")
+    return 2 * log_psi
+
+def per_electron_kernel(
+    wave_function: WaveFunction,
+    electron_spins: Array,
+    nuclei: Nucleus,
+    num_electrons: int,
+    rng_key: Key,
+    electron_i: Array, # Scalar, which electron to update
+    electron_positions: Array, # Shape (num_electrons, 3)
+):
+    mala_kernel = blackjax.mala.build_kernel()
+    step_size = 0.1  # TODO: Figure out a good step size adaptation scheme
+
+    # The gradient of the wave-functions tends to infinity around the cusps and nodes.
+    # Clip the gradient during sampling to make it more stable.
+    @clip_grad_global(max_norm=1.0)
+    def per_electron_logdensity(
+        proposed_position_i: Array, # Shape (3,)
+    ) -> Array:
+        return call_wavefunction_wrapper(
+            proposed_position_i=proposed_position_i,
+            electron_i=electron_i,
+            electron_positions=electron_positions,
+            wave_function=wave_function,
+            electron_spins=electron_spins,
+            nuclei=nuclei,
+            num_electrons=num_electrons,
+        )
+    chain_state = blackjax.mala.init(electron_positions[electron_i], logdensity_fn=lambda x: 0.0)
+
+    chain_state, info = mala_kernel(rng_key, chain_state, per_electron_logdensity, step_size)
+
+    acceptance_rate = info.acceptance_rate
+    updated_electron_i_pos = chain_state.position
+    log_density = chain_state.logdensity
+    new_electron_positions = electron_positions.at[electron_i].set(updated_electron_i_pos)
+
+    return new_electron_positions, log_density, acceptance_rate
 
 
 @nnx.jit(static_argnames=["sum_of_charges", "num_chains", "num_samples", "mcmc_burnin_steps", "mcmc_thinning_factor"])
@@ -660,108 +731,58 @@ def sample_from_wavefunction(
     initial_positions = init_electrons(nuclei, num_chains=num_chains, rng=init_electrons_key, sum_of_charges=sum_of_charges)
     chex.assert_shape(initial_positions.position, (num_chains, sum_of_charges, 3))
     num_electrons = initial_positions.position.shape[1]
-
-
-    # Code the actually do MCMC sampling
-    def call_wavefunction_wrapper(
-        # The MCMC chain will move only the position of one electron at a time
-        proposed_position_i: Array, # Shape (3,)
-        electron_i: int,
-        original_positions: Array, # Shape (num_electrons, 3)
-        *,
-        electron_spins: Array,
-        nuclei: Nucleus,
-        graphdef: nnx.GraphDef,
-        state: nnx.State
-    ) -> Array:
-        chex.assert_shape(proposed_position_i, (3,))
-        chex.assert_shape(original_positions, (num_electrons, 3))
-
-        wave_function = nnx.merge(graphdef, state)
-        proposed_positions = original_positions.at[electron_i].set(proposed_position_i)
-        # print(f"Electrons shape: {all_positions.shape}")
-
-        electrons = Electron(position=proposed_positions, spin=electron_spins)
-        log_psi, _sign, _ortho_measure = wave_function(electrons, nuclei)
-        # print(f"Wave function output shape: {log_psi.shape}")
-        return 2 * log_psi
-
-    graphdef, state = nnx.split(wave_function)
-    logdensity_fn = partial(call_wavefunction_wrapper,
-                            electron_spins=initial_positions.spin[0],
-                            graphdef=graphdef,
-                            nuclei=nuclei,
-                            state=state
-                            )
-
-    mala_kernel = blackjax.mala.build_kernel()
-    step_size = 0.1  # TODO: Figure out a good step size adaptation scheme
-
-    def per_electron_kernel(
-        rng_key: Key,
-        electron_i: Array, # Scalar, which electron to update
-        electron_positions: Array, # Shape (num_electrons, 3)
+            
+    # We want to update the electron positions one by one - proposing moves of all of them
+    # at the same time, makes the acceptance rate very low and can cause weird behaviors
+    @nnx.scan(in_axes=(None, 0, nnx.Carry, 0), out_axes=(nnx.Carry, 0, 0))
+    def scan_electrons(
+        wave_function: WaveFunction,
+        electron_i: Array, # Scalar, which electron to update on which chain
+        electron_positions: Array, # Shape (num_electrons, 3): current positions of all electrons on this chain
+        electron_step_key: Key,
     ):
-        # The gradient of the wave-functions tends to infinity around the cusps and nodes.
-        # Clip the gradient during sampling to make it more stable.
-        @clip_grad_global(max_norm=1.0)
-        def per_electron_logdensity(
-            proposed_position_i: Array, # Shape (3,)
-        ) -> Array:
-            return logdensity_fn(proposed_position_i, electron_i, electron_positions)
-        chain_state = blackjax.mala.init(electron_positions[electron_i], logdensity_fn=per_electron_logdensity)
-
-        chain_state, info = mala_kernel(rng_key, chain_state, per_electron_logdensity, step_size)
-
-        acceptance_rate = info.acceptance_rate
-        updated_electron_i_pos = chain_state.position
-        log_density = chain_state.logdensity
-        new_electron_positions = electron_positions.at[electron_i].set(updated_electron_i_pos)
+        new_electron_positions, log_density, acceptance_rate = per_electron_kernel(
+            wave_function=wave_function,
+            electron_spins=initial_positions.spin[0],  # All chains have the same spins
+            nuclei=nuclei,
+            num_electrons=num_electrons,
+            rng_key=electron_step_key,
+            electron_i=electron_i,
+            electron_positions=electron_positions,
+        )
+        # print(f"New chain state: {new_chain_state}")
+        # electron_state_sample, log_density = new_chain_state
 
         return new_electron_positions, log_density, acceptance_rate
+        
+    @nnx.vmap(in_axes=(None, 0, 0, 0), out_axes=0)
+    def map_chains(
+        wave_function: WaveFunction,
+        electron_indices: Array, # Shape (num_chains, num_electrons)
+        electron_positions: Array, # Shape (num_chains, num_electrons, 3)
+        step_key: Key,
+    ):
+        new_electron_positions, log_density, acceptance_rate = scan_electrons(
+            wave_function,
+            electron_indices,
+            electron_positions,
+            jax.random.split(step_key, num_electrons),
+        )
 
+        return new_electron_positions, jnp.mean(log_density), jnp.mean(acceptance_rate)
 
-    @nnx.scan(in_axes=(0, nnx.Carry, 0), out_axes=(0, nnx.Carry, 0, 0), length=num_samples)
+    @nnx.scan(in_axes=(None, 0, nnx.Carry, 0), out_axes=(0, nnx.Carry, 0, 0), length=num_samples)
     def scan_num_samples(
+        wave_function: WaveFunction,
         electron_indices: Array, # Shape (num_samples, num_chains, num_electrons) the order in which to update the electrons
         electron_positions: Array, # Carry of shape (num_chains, num_electrons, 3)
         step_key: Key
     ):
-
-        @jax.vmap
-        def map_chains(
-            electron_indices: Array, # Shape (num_chains, num_electrons)
-            electron_positions: Array, # Shape (num_chains, num_electrons, 3)
-            step_key: Key,
-        ):
-
-            # We want to update the electron positions one by one - proposing moves of all of them
-            # at the same time, makes the acceptance rate very low and can cause weird behaviors
-            @nnx.scan(in_axes=(0, nnx.Carry, 0), out_axes=(nnx.Carry, 0, 0))
-            def scan_electrons(
-                electron_i: Array, # Scalar, which electron to update on which chain
-                electron_positions: Array, # Shape (num_electrons, 3): current positions of all electrons on this chain
-                electron_step_key: Key,
-            ):
-                new_electron_positions, log_density, acceptance_rate = per_electron_kernel(electron_step_key, electron_i, electron_positions)
-                # print(f"New chain state: {new_chain_state}")
-                # electron_state_sample, log_density = new_chain_state
-
-                return new_electron_positions, log_density, acceptance_rate
-
-            new_electron_positions, log_density, acceptance_rate = scan_electrons(
-                electron_indices,
-                electron_positions,
-                jax.random.split(step_key, num_electrons),
-            )
-
-            return new_electron_positions, jnp.mean(log_density), jnp.mean(acceptance_rate)
-
-
         chex.assert_shape(electron_indices, (num_chains, num_electrons))
         chex.assert_shape(electron_positions, (num_chains, num_electrons, 3))
         chain_keys = jax.random.split(step_key, num_chains)
         new_electron_positions, log_density, acceptance_rate = map_chains(
+            wave_function,
             electron_indices,
             electron_positions,
             chain_keys,
@@ -783,7 +804,12 @@ def sample_from_wavefunction(
     chex.assert_shape(electron_permutations, (num_samples, num_chains, num_electrons))
 
     step_keys = jax.random.split(key, num_samples)
-    electron_position_samples, _last_position, log_densities, acceptance_rate = scan_num_samples(electron_permutations, initial_positions.position, step_keys)
+    electron_position_samples, _last_position, log_densities, acceptance_rate = scan_num_samples(
+        wave_function,
+        electron_permutations,
+        initial_positions.position,
+        step_keys
+    )
     chex.assert_shape(electron_position_samples, (num_samples, num_chains, num_electrons, 3))
     # print(f"Electron position shape: {electron_position_samples.shape}, initial position spin shape: {initial_positions.spin.shape}")
     # replicated_spins = jnp.tile(initial_positions.spin, (num_samples, 1, 1, 1))
@@ -1007,19 +1033,21 @@ def train_wavefunction(
     sum_of_charges = int(jnp.sum(nuclei.charge))
 
     # Start the optimization loop
+    cached_sample_and_optimize = nnx.cached_partial(
+        sample_and_optimize_wave_function,
+        wave_function,
+        optimizer,
+        nuclei,
+        int(sum_of_charges),
+        int(num_chains),
+        int(num_samples),
+    )
+
     step_keys = jax.random.split(step_key, num_steps)
     for step, step_key in enumerate(step_keys):
         print(f"Step {step}/{num_steps}")
 
-        samples, avg_energy, hamiltonian_details, log_psi, acceptance_rate = sample_and_optimize_wave_function(
-            wave_function=wave_function,
-            optimizer=optimizer,
-            nuclei=nuclei,
-            sum_of_charges=int(sum_of_charges),
-            num_chains=int(num_chains),
-            num_samples=int(num_samples),
-            key=step_key,
-        )
+        samples, avg_energy, hamiltonian_details, log_psi, acceptance_rate = cached_sample_and_optimize(step_key)
 
         print(f"Average energy step {step}: {avg_energy}")
         print(f"Hamiltonian details step {step}: {hamiltonian_details}")
