@@ -260,7 +260,7 @@ class DistanceEncoder(nnx.Module):
             chex.assert_shape(magnitudes, (None, None))  # Expecting a magnitude for every pair
             diffs = (magnitudes[:, :, None] - self.centers[None, None, :]) / self.sigma
             return jnp.exp(-0.5 * (diffs ** 2))
-        
+
         @nnx.vmap
         def _real_sh_L3(direction: Array):
             chex.assert_shape(direction, (None, 3))  # Expecting a 3D unit vector
@@ -584,6 +584,9 @@ class WaveFunction(nnx.Module):
         def calc_slater(slaters: List[SlaterDeterminant], distances: Distances, spins: Array, distance_encoders: DistanceEncoders) -> Array:
             results = [slater(distances, spins, distance_encoders=distance_encoders) for slater in slaters]
             slater_logs, slater_signs, orthonormality_measures = zip(*results)
+            # print(f"Slater logs: {slater_logs}")
+            # print(f"Slater signs: {slater_signs}")
+            # print(f"Orthonormality measures: {orthonormality_measures}")
             return jnp.array(slater_logs), jnp.array(slater_signs), jnp.array(orthonormality_measures)
 
         slater_logs, slater_signs, orthonormality_measures = calc_slater(self.slater_determinants, distances, electrons.spin, self.distance_encoders)
@@ -703,7 +706,7 @@ def per_electron_kernel(
             nuclei=nuclei,
             num_electrons=num_electrons,
         )
-    chain_state = blackjax.mala.init(electron_positions[electron_i], logdensity_fn=lambda x: 0.0)
+    chain_state = blackjax.mala.init(electron_positions[electron_i], logdensity_fn=per_electron_logdensity)
 
     chain_state, info = mala_kernel(rng_key, chain_state, per_electron_logdensity, step_size)
 

@@ -110,9 +110,9 @@ def main(_args):
 
         electronic_steps = 25 # 100
         nuclei_steps = 1
-        num_chains = 50
+        num_chains = 25
         num_electronic_samples = 250
-        num_nuclei_samples = 650
+        num_nuclei_samples = 450
 
         train_wavefunction(
             wave_function,
