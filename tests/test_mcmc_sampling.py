@@ -165,6 +165,9 @@ def test_sample_from_wavefunction_analytical_gaussian():
     assert 0.3 < float(acceptance_rate) < 1.0
     assert jnp.all(jnp.isfinite(log_densities))
 
+    expected_log_densities = -jnp.sum(((samples.position - mu) / sigma) ** 2, axis=(-2, -1))
+    chex.assert_trees_all_close(log_densities, expected_log_densities, atol=1e-5, rtol=1e-5)
+
     # Each electron independently follows N(mu, (sigma^2/2) * I).
     flat_positions = samples.position.reshape(-1, 3)
     empirical_mean = jnp.mean(flat_positions, axis=0)

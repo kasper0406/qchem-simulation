@@ -895,7 +895,7 @@ def sample_from_wavefunction(
             jax.random.split(step_key, num_electrons),
         )
 
-        return new_electron_positions, jnp.mean(log_density), jnp.mean(acceptance_rate)
+        return new_electron_positions, log_density[-1], jnp.mean(acceptance_rate)
 
     @nnx.scan(in_axes=(None, 0, nnx.Carry, 0), out_axes=(0, nnx.Carry, 0, 0), length=num_samples)
     def scan_num_samples(
@@ -941,7 +941,9 @@ def sample_from_wavefunction(
     # replicated_spins = jnp.tile(initial_positions.spin, (num_samples, 1, 1, 1))
 
     # Apply burn-in and thinning
-    electron_position_samples = electron_position_samples[mcmc_burnin_steps::mcmc_thinning_factor, ...]
+    kept_steps = slice(mcmc_burnin_steps, None, mcmc_thinning_factor)
+    electron_position_samples = electron_position_samples[kept_steps]
+    log_densities = log_densities[kept_steps]
     replicated_spins = jnp.tile(initial_positions.spin, (electron_position_samples.shape[0], 1, 1, 1))
 
     chex.assert_shape(replicated_spins, (electron_position_samples.shape[0], num_chains, num_electrons, 1))
