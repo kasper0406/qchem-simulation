@@ -17,6 +17,7 @@ from .utils import Electron, Nucleus
 class Distance:
     magnitude: Array  # Shape (n, n)
     direction: Array  # Unit vector shape (n, n, 3)
+    displacement: Array | None = None
 
 @jax.tree_util.register_dataclass
 @dataclass
@@ -97,24 +98,23 @@ class TransformerStack(nnx.Module):
 
 def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_half: bool = False) -> Distance:
     """
-    Calculate distance features between two sets of positions.
-    Returns the squared distances and the inverse distances.
+    Calculate pair distances and directions between two sets of positions.
 
     Rows will be from position_a, and columns will be from position_b.
     """
-    eps = 1e-12
     diff = position_a[:, None] - position_b[None, :]
     square_distances = jnp.sum(jnp.square(diff), axis=-1)
-    distances = jnp.sqrt(square_distances + eps)
-
-    unit_vectors = diff * jax.lax.rsqrt(square_distances[:, :, None] + eps)
+    separated = square_distances > 0
+    safe_distances = jnp.sqrt(jnp.where(separated, square_distances, 1.0))
+    distances = jnp.where(separated, safe_distances, 0.0)
+    unit_vectors = diff / safe_distances[..., None]
 
     if upper_half:
         # Keep only the upper half of the matrix (i.e., distances between different electrons)
         # print("Inside upper half calculation")
         upper_indices = jnp.triu_indices(distances.shape[0], k=1)
         distances = jnp.reshape(distances[upper_indices], (-1, ))
-        square_distances = jnp.reshape(square_distances[upper_indices], (-1, ))
+        diff = diff[upper_indices]
 
         # Notice the unit vectors will only keep one direction per pair of particles
         # when the upper half is selected
@@ -123,6 +123,7 @@ def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_hal
     return Distance(
         magnitude=distances,
         direction=unit_vectors,
+        displacement=diff,
     )
 
 
@@ -151,6 +152,9 @@ class StaticValue(nnx.Variable):
     pass
 
 
+_COALESCENCE_RADIUS = 0.1  # bohr
+
+
 class DistanceEncoder(nnx.Module):
     def __init__(self, hidden_dim: int, buckets: int, rngs: nnx.Rngs, cutoff: float = 10.0):
         self.centers = StaticValue(jnp.linspace(0.0, cutoff, buckets))
@@ -168,6 +172,12 @@ class DistanceEncoder(nnx.Module):
     def __call__(self, distance: Distance):
         chex.assert_shape(distance.magnitude, (None, None))
         chex.assert_shape(distance.direction, (None, None, 3))
+        displacement = distance.displacement
+        if displacement is None:
+            displacement = distance.direction * distance.magnitude[..., None]
+        radius_sq = jnp.sum(jnp.square(displacement), axis=-1)
+        smooth_radius = jnp.sqrt(radius_sq + _COALESCENCE_RADIUS**2)
+        bounded_displacement = displacement / smooth_radius[..., None]
 
         def _rbf_encoding(magnitudes: Array):
             """
@@ -178,9 +188,10 @@ class DistanceEncoder(nnx.Module):
             return jnp.exp(-0.5 * (diffs ** 2))
 
         @nnx.vmap
-        def _real_sh_L3(direction: Array):
-            chex.assert_shape(direction, (None, 3))  # Expecting a 3D unit vector
-            x, y, z = jnp.moveaxis(direction, -1, 0)
+        def _real_solid_harmonics_L3(displacement: Array):
+            chex.assert_shape(displacement, (None, 3))
+            x, y, z = jnp.moveaxis(displacement, -1, 0)
+            r2 = x*x + y*y + z*z
 
             # l = 1 (dipoles)
             c1 = 0.4886025119029199
@@ -191,16 +202,16 @@ class DistanceEncoder(nnx.Module):
             # l = 2 (quadrupoles)
             Y2m2 = 1.0925484305920792 * x * y
             Y2m1 = 1.0925484305920792 * y * z
-            Y20  = 0.31539156525252005 * (3.0 * z*z - 1.0)
+            Y20  = 0.31539156525252005 * (3.0 * z*z - r2)
             Y21  = 1.0925484305920792 * x * z
             Y22  = 0.5462742152960396 * (x*x - y*y)
 
             # l = 3 (octupoles) – fully-normalized real SH
             Y3m3 = 0.5900435899266435 * y * (3.0 * x*x - y*y)
             Y3m2 = 2.890611442640554 * x * y * z
-            Y3m1 = 0.4570457994644658 * y * (5.0 * z*z - 1.0)
-            Y30  = 0.3731763325901154 * z * (5.0 * z*z - 3.0)
-            Y31  = 0.4570457994644658 * x * (5.0 * z*z - 1.0)
+            Y3m1 = 0.4570457994644658 * y * (5.0 * z*z - r2)
+            Y30  = 0.3731763325901154 * z * (5.0 * z*z - 3.0 * r2)
+            Y31  = 0.4570457994644658 * x * (5.0 * z*z - r2)
             Y32  = 1.445305721320277 * z * (x*x - y*y)
             Y33  = 0.5900435899266435 * x * (x*x - 3.0 * y*y)
 
@@ -214,8 +225,9 @@ class DistanceEncoder(nnx.Module):
 
             return stacked
 
-        radial_features = self.rbf_proj(_rbf_encoding(distance.magnitude))
-        direction_features = self.direction_proj(_real_sh_L3(distance.direction))
+        radial_features = self.rbf_proj(_rbf_encoding(smooth_radius))
+        # Solid harmonics are smooth at zero and approach spherical harmonics at long range.
+        direction_features = self.direction_proj(_real_solid_harmonics_L3(bounded_displacement))
         combined_features = jnp.concat([radial_features, direction_features], axis=-1)
 
         up_projected = self.feature_up_proj(combined_features)
@@ -417,8 +429,9 @@ class CuspElectronNuclei(nnx.Module):
 class ExponentialEnvelope(nnx.Module):
     """
     Permutation-invariant learnable exponential decay envelope ensuring normalizability:
-    log_env(r) = sum_i log(sum_I pi_I * exp(-sigma_I * r_{iI}))
+    log_env(r) = sum_i log(sum_I pi_I * exp(-sigma_I * sqrt(r_{iI}^2 + a^2)))
     where pi_I > 0 and sigma_I > 0 are per-nucleus parameters broadcast over all electrons.
+    The softened radius has zero radial slope at each center, leaving the cusp to the Jastrow factor.
     """
     def __init__(self, num_nuclei: int):
         self.num_nuclei = num_nuclei
@@ -430,9 +443,10 @@ class ExponentialEnvelope(nnx.Module):
         chex.assert_axis_dimension(electron_nuclei_distances, 1, self.num_nuclei)
 
         pi = jax.nn.softplus(self.pi[...]) + 1e-8
-        sigma = jax.nn.softplus(self.sigma[...])
+        sigma = jax.nn.softplus(self.sigma[...]) + 1e-8
 
-        log_terms = jnp.log(pi[None, :]) - sigma[None, :] * electron_nuclei_distances
+        smooth_radius = jnp.sqrt(jnp.square(electron_nuclei_distances) + _COALESCENCE_RADIUS**2)
+        log_terms = jnp.log(pi[None, :]) - sigma[None, :] * smooth_radius
         return jnp.sum(jax.scipy.special.logsumexp(log_terms, axis=-1), axis=-1)
 
 

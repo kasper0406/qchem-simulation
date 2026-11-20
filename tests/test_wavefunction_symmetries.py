@@ -11,6 +11,7 @@ from qchem_simulation.electronic_optimization import (
     WaveFunction,
     calculate_distances,
     calculate_kinetic_energy,
+    hamiltonian,
 )
 from qchem_simulation.utils import Electron, Nucleus
 
@@ -193,3 +194,27 @@ def test_wavefunction_kinetic_energy_and_grad_finite():
     grads = nnx.grad(loss_fn)(wf)
     grad_leaves = jax.tree_util.tree_leaves(grads)
     assert all(jnp.all(jnp.isfinite(g)) for g in grad_leaves)
+
+
+def test_neural_hydrogen_has_a_coulomb_cusp():
+    wf = WaveFunction(num_electrons=1, num_nuclei=1, rngs=nnx.Rngs(12))
+    nuclei = Nucleus(position=jnp.zeros((1, 3)), charge=jnp.ones(1))
+    spin = jnp.ones((1, 1))
+    directions = jnp.concatenate((jnp.eye(3), -jnp.eye(3)))
+    radius = 1e-4
+
+    @nnx.jit
+    @nnx.vmap(in_axes=(None, 0))
+    def evaluate(model, position):
+        electrons = Electron(position=position[None, :], spin=spin)
+        energy, _ = hamiltonian(model, electrons, nuclei, jax.random.key(0))
+        return model(electrons, nuclei)[0], energy
+
+    origin_log, _, _ = wf(Electron(position=jnp.zeros((1, 3)), spin=spin), nuclei)
+    nearby_logs, energies = evaluate(wf, radius * directions)
+    # Opposite directions cancel the linear terms from the smooth part of log|psi|.
+    spherical_slope = (jnp.mean(nearby_logs) - origin_log) / radius
+    chex.assert_trees_all_close(spherical_slope, -1.0, atol=0.05)
+    chex.assert_tree_all_finite(energies)
+    # A wrong cusp slope of order one leaves a local-energy pole of order 1/r.
+    assert jnp.max(jnp.abs(energies)) < 0.1 / radius
