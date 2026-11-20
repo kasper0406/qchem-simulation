@@ -112,19 +112,23 @@ def test_full_and_batched_match_with_nonzero_lambda_virial():
     )
 
 
+@jax.enable_x64()
 def test_full_and_batched_match_neural_wavefunction():
     """Compare neural VMC gradients through unit SGD updates."""
     nuclei = Nucleus(
-        position=jnp.array([[0.0, 0.0, 0.0]], dtype=jnp.float32),
-        charge=jnp.array([2.0], dtype=jnp.float32),
+        position=jnp.array([[0.0, 0.0, 0.0]], dtype=jnp.float64),
+        charge=jnp.array([2.0], dtype=jnp.float64),
     )
     num_samples = 12
-    pos = jax.random.normal(jax.random.key(10), shape=(num_samples, 2, 3)) * 0.5
-    spins = jnp.tile(jnp.array([[1.0], [-1.0]], dtype=jnp.float32)[None, :, :], (num_samples, 1, 1))
+    pos = jax.random.normal(
+        jax.random.key(10), shape=(num_samples, 2, 3), dtype=jnp.float32
+    ).astype(jnp.float64) * 0.5
+    spins = jnp.tile(jnp.array([[1.0], [-1.0]], dtype=jnp.float64)[None, :, :], (num_samples, 1, 1))
     samples = Electron(position=pos, spin=spins)
 
     wf_full = WaveFunction(num_electrons=2, num_nuclei=1, rngs=nnx.Rngs(123))
-    wf_batched = WaveFunction(num_electrons=2, num_nuclei=1, rngs=nnx.Rngs(123))
+    nnx.update(wf_full, jax.tree.map(lambda p: p.astype(jnp.float64), nnx.state(wf_full, nnx.Param)))
+    wf_batched = nnx.clone(wf_full)
 
     initial_params = jax.tree.map(jnp.copy, nnx.state(wf_full, nnx.Param))
     opt_full = nnx.ModelAndOptimizer(wf_full, optax.sgd(1.0))
@@ -138,13 +142,12 @@ def test_full_and_batched_match_neural_wavefunction():
         wf_batched, opt_batched, samples, nuclei, step_key, batch_size=4
     )
 
-    chex.assert_trees_all_close(e_full, e_batched, rtol=1e-4, atol=1e-5)
-    chex.assert_trees_all_close(h_full, h_batched, rtol=1e-4, atol=1e-5)
-    chex.assert_trees_all_close(lp_full, lp_batched, rtol=1e-4, atol=1e-5)
+    chex.assert_trees_all_close(e_full, e_batched, rtol=1e-7, atol=1e-8)
+    chex.assert_trees_all_close(h_full, h_batched, rtol=1e-7, atol=1e-8)
+    chex.assert_trees_all_close(lp_full, lp_batched, rtol=1e-7, atol=1e-8)
     update_full = jax.tree.map(jnp.subtract, nnx.state(wf_full, nnx.Param), initial_params)
     update_batched = jax.tree.map(jnp.subtract, nnx.state(wf_batched, nnx.Param), initial_params)
-    # Batched and full float32 reductions visit samples in different orders.
-    chex.assert_trees_all_close(update_full, update_batched, rtol=1e-4, atol=1e-4)
+    chex.assert_trees_all_close(update_full, update_batched, rtol=1e-7, atol=1e-8)
 
 
 def test_vmc_gradient_matches_exact_score_function_formula():

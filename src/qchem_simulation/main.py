@@ -8,9 +8,11 @@ import os
 from jaxtyping import Array, Key
 import plotly.graph_objects as go
 
-from .electronic_optimization import WaveFunction, train_wavefunction, sample_from_wavefunction
+from .electronic_optimization import train_wavefunction
 from .nuclei_optimization import optimize_nuclei
+from .sampling import sample_from_wavefunction
 from .utils import Nucleus
+from .wavefunction import WaveFunction
 
 from folx import register_function, wrap_forward_laplacian
 
