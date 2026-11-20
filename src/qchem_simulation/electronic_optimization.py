@@ -191,7 +191,7 @@ def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_hal
     square_distances = jnp.sum(jnp.square(diff), axis=-1)
     distances = jnp.sqrt(square_distances + eps)
 
-    unit_vectors = diff * jax.lax.rsqrt(distances[:, :, None] + eps)
+    unit_vectors = diff * jax.lax.rsqrt(square_distances[:, :, None] + eps)
 
     if upper_half:
         # Keep only the upper half of the matrix (i.e., distances between different electrons)
@@ -260,7 +260,7 @@ class DistanceEncoder(nnx.Module):
             chex.assert_shape(magnitudes, (None, None))  # Expecting a magnitude for every pair
             diffs = (magnitudes[:, :, None] - self.centers[None, None, :]) / self.sigma
             return jnp.exp(-0.5 * (diffs ** 2))
-        
+
         @nnx.vmap
         def _real_sh_L3(direction: Array):
             chex.assert_shape(direction, (None, 3))  # Expecting a 3D unit vector
@@ -325,6 +325,8 @@ class FlatDistanceEncoder(nnx.Module):
         self.encoder = DistanceEncoder(hidden_dim, buckets, rngs, cutoff)
 
     def __call__(self, distances: Distance):
+        if distances.magnitude.shape[0] == 0:
+            return jnp.zeros((self.encoder.final_proj.out_features,), dtype=distances.magnitude.dtype)
         expanded = jax.tree.map(lambda x: x[None, :], distances)
         return self.encoder(expanded)[0]
 
@@ -522,26 +524,48 @@ def slater_log_sum_exp(slater_logs, slater_signs, slater_coeffs):
         - log_psi_abs: The log of the absolute value of the total wavefunction.
         - sign_psi: The sign (+1 or -1) of the total wavefunction.
     """
+    slater_logs = jnp.asarray(slater_logs)
+    slater_signs = jnp.asarray(slater_signs)
+    slater_coeffs = jnp.asarray(slater_coeffs)
+
+    dtype = jnp.result_type(slater_logs, slater_coeffs, jnp.float32)
+    eps = jnp.asarray(1e-12, dtype=dtype)
+
+    abs_coeffs = jnp.abs(slater_coeffs)
+    valid_mask = (abs_coeffs > 0) & jnp.isfinite(slater_logs)
+    safe_abs_coeffs = jnp.where(valid_mask, abs_coeffs, jnp.ones_like(abs_coeffs))
+    safe_logs = jnp.where(valid_mask, slater_logs, jnp.zeros_like(slater_logs))
+
     # Calculate the log-magnitude of each term in the expansion
     # log|T_i| = log|c_i| + log|D_i|
-    log_term_magnitudes = jnp.log(jnp.abs(slater_coeffs)) + slater_logs
+    log_term_magnitudes = jnp.log(safe_abs_coeffs) + safe_logs
 
-    # Find the dominant term's magnitude (the 'x_max' in the standard trick)
-    max_log_mag = jnp.max(log_term_magnitudes)
+    # Find the dominant term's magnitude among valid terms (the 'x_max' in the standard trick)
+    any_valid = jnp.any(valid_mask)
+    min_log_mag = jnp.min(log_term_magnitudes) - jnp.asarray(1.0, dtype=dtype)
+    masked_log_mags = jnp.where(valid_mask, log_term_magnitudes, min_log_mag)
+    max_log_mag = jnp.where(any_valid, jnp.max(masked_log_mags), jnp.asarray(0.0, dtype=dtype))
+    max_log_mag = jax.lax.stop_gradient(max_log_mag)
 
     # Calculate the sum of terms, normalized by the largest term to prevent overflow.
     # The value of each term in the sum is:
     # sign(c_i)*s_i*exp(log|c_i| + ld_i - max_log_mag)
-    sum_val = jnp.sum(
-        jnp.sign(slater_coeffs) * slater_signs * jnp.exp(log_term_magnitudes - max_log_mag)
+    scaled_exponents = jnp.where(valid_mask, log_term_magnitudes - max_log_mag, jnp.asarray(0.0, dtype=dtype))
+    terms = jnp.where(
+        valid_mask,
+        jnp.sign(slater_coeffs) * slater_signs * jnp.exp(scaled_exponents),
+        jnp.asarray(0.0, dtype=dtype),
     )
+    sum_val = jnp.sum(terms)
 
     # The final sign is the sign of this normalized sum
     sign_psi = jnp.sign(sum_val)
 
     # The final log-magnitude is the log of the dominant term's magnitude
     # plus the log of the absolute value of the normalized sum.
-    log_psi_abs = max_log_mag + jnp.log(jnp.abs(sum_val))
+    # Clamp |sum_val| away from 0 so nodal surfaces (sum_val == 0) yield finite values and gradients.
+    safe_abs_sum = jnp.maximum(jnp.abs(sum_val), eps)
+    log_psi_abs = max_log_mag + jnp.log(safe_abs_sum)
 
     return log_psi_abs, sign_psi
 
@@ -584,6 +608,9 @@ class WaveFunction(nnx.Module):
         def calc_slater(slaters: List[SlaterDeterminant], distances: Distances, spins: Array, distance_encoders: DistanceEncoders) -> Array:
             results = [slater(distances, spins, distance_encoders=distance_encoders) for slater in slaters]
             slater_logs, slater_signs, orthonormality_measures = zip(*results)
+            # print(f"Slater logs: {slater_logs}")
+            # print(f"Slater signs: {slater_signs}")
+            # print(f"Orthonormality measures: {orthonormality_measures}")
             return jnp.array(slater_logs), jnp.array(slater_signs), jnp.array(orthonormality_measures)
 
         slater_logs, slater_signs, orthonormality_measures = calc_slater(self.slater_determinants, distances, electrons.spin, self.distance_encoders)
@@ -703,7 +730,7 @@ def per_electron_kernel(
             nuclei=nuclei,
             num_electrons=num_electrons,
         )
-    chain_state = blackjax.mala.init(electron_positions[electron_i], logdensity_fn=lambda x: 0.0)
+    chain_state = blackjax.mala.init(electron_positions[electron_i], logdensity_fn=per_electron_logdensity)
 
     chain_state, info = mala_kernel(rng_key, chain_state, per_electron_logdensity, step_size)
 
@@ -726,7 +753,7 @@ def sample_from_wavefunction(
     mcmc_burnin_steps: int = 50,
     mcmc_thinning_factor: int = 2,
 ):
-    init_electrons_key, init_sampler_key, sample_key = jax.random.split(key, 3)
+    init_electrons_key, perm_key, step_key = jax.random.split(key, 3)
 
     initial_positions = init_electrons(nuclei, num_chains=num_chains, rng=init_electrons_key, sum_of_charges=sum_of_charges)
     chex.assert_shape(initial_positions.position, (num_chains, sum_of_charges, 3))
@@ -800,10 +827,10 @@ def sample_from_wavefunction(
         def _generate(key: Key) -> Array:
             return jax.random.permutation(key, jnp.arange(num_electrons))
         return _generate(jax.random.split(key, num_chains))
-    electron_permutations = generate_electron_permutation(jax.random.split(sample_key, num_samples))
+    electron_permutations = generate_electron_permutation(jax.random.split(perm_key, num_samples))
     chex.assert_shape(electron_permutations, (num_samples, num_chains, num_electrons))
 
-    step_keys = jax.random.split(key, num_samples)
+    step_keys = jax.random.split(step_key, num_samples)
     electron_position_samples, _last_position, log_densities, acceptance_rate = scan_num_samples(
         wave_function,
         electron_permutations,
@@ -864,42 +891,48 @@ def optimize_wave_function_full(
     optimizer: nnx.Optimizer,
     samples: Electron,
     nuclei: Nucleus,
+    key: Key,
     *,
-    lambda_virial: float = 1e-3,
-key: Key) -> Array:
+    lambda_virial: float = 0.0,
+) -> Array:
+    """Perform a single VMC optimization step over all samples at once.
+
+    Computes the unbiased VMC energy gradient:
+        E[(E_L - <E_L>) * grad_theta log |psi|^2].
+
+    Note: ``lambda_virial`` defaults to 0.0 because a pointwise (2*T_L + V)^2
+    penalty is physically invalid (the virial theorem 2<T> + <V> = 0 holds only
+    for expectation values at equilibrium nuclear geometry, and the score-function
+    estimator omits the grad_theta T_L term).
+    """
     keys = jax.random.split(key, samples.position.shape[0])
 
     local_energies, log_grads, hamiltonian_details, log_psi = nnx.vmap(local_energy, in_axes=(None, 0, None, 0))(wave_function, samples, nuclei, keys)
-    # print(f"Log gradients: {log_grads}")
 
     avg_energy = jnp.mean(local_energies)
-    centered_energies = local_energies - avg_energy
-    # print(f"Energy offsets: {centered_energies}")
 
-    # The introduced penalty terms is to:
-    #  1. keep 2T+V=0 (virial theorem)
-    #  2. keep the orbitals orthonormal
     virial_penalty = jnp.square(2 * hamiltonian_details.kinetic_energy + hamiltonian_details.potential_energy)
-    penalty_terms = lambda_virial * virial_penalty # + lambda_ortho * orthonormality_measure
+    penalty_terms = lambda_virial * virial_penalty
+
+    loss_terms = local_energies + penalty_terms
+    centered_loss_terms = loss_terms - jnp.mean(loss_terms)
 
     loss_gradient = jax.tree.map(
-        lambda log_grads: jnp.expand_dims(centered_energies + penalty_terms, axis=tuple(range(1, log_grads.ndim))) * log_grads,
+        lambda log_grad: jnp.expand_dims(centered_loss_terms, axis=tuple(range(1, log_grad.ndim))) * log_grad,
         log_grads,
     )
-    # print(f"Loss gradient: {loss_gradient}")
 
     mean_loss_grads = jax.tree.map(
-        lambda loss_gradient: jnp.mean(loss_gradient, axis=0),
+        lambda lg: jnp.mean(lg, axis=0),
         loss_gradient,
     )
-    # print(f"Mean loss gradients: {mean_loss_grads}")
 
     optimizer.update(mean_loss_grads)
 
     mean_hamiltonian_details = jax.tree.map(lambda x: jnp.mean(x, axis=0), hamiltonian_details)
     return avg_energy, mean_hamiltonian_details, jnp.mean(log_psi)
 
-@nnx.jit
+@nnx.jit(static_argnames=["batch_size"])
 def optimize_wave_function_batched(
     wave_function: WaveFunction,
     optimizer: nnx.Optimizer,
@@ -908,8 +941,18 @@ def optimize_wave_function_batched(
     key: Key,
     *,
     batch_size: int = 100,
-    lambda_virial: float = 1e-3,
+    lambda_virial: float = 0.0,
 ) -> Array:
+    """Perform a single VMC optimization step by accumulating gradients over batches.
+
+    Computes the exact same VMC energy gradient as ``optimize_wave_function_full``:
+        E[(E_L - <E_L>) * grad_theta log |psi|^2].
+
+    Note: ``lambda_virial`` defaults to 0.0 because a pointwise (2*T_L + V)^2
+    penalty is physically invalid (the virial theorem 2<T> + <V> = 0 holds only
+    for expectation values at equilibrium nuclear geometry, and the score-function
+    estimator omits the grad_theta T_L term).
+    """
 
     @nnx.scan(
         in_axes=(None, nnx.Carry, 0, 0),
@@ -921,11 +964,8 @@ def optimize_wave_function_batched(
 
         local_energies, log_grads, hamiltonian_details, log_psi = nnx.vmap(local_energy, in_axes=(None, 0, None, 0))(wave_function, batch_samples, nuclei, keys)
 
-        # The introduced penalty terms is to:
-        #  1. keep 2T+V=0 (virial theorem)
-        #  2. keep the orbitals orthonormal
         virial_penalty = jnp.square(2 * hamiltonian_details.kinetic_energy + hamiltonian_details.potential_energy)
-        penalty_terms = lambda_virial * virial_penalty # + lambda_ortho * orthonormality_measure
+        penalty_terms = lambda_virial * virial_penalty
 
         loss_terms = local_energies + penalty_terms
 
@@ -968,8 +1008,9 @@ def optimize_wave_function_batched(
     )
 
     # Compute the mean loss grads by using linearity of expectations:
-    #   E[((E_L - <E_L>) + penalty_terms) * log_grads] = E[E_L * log_grads] - <E_L> * E[log_grads]
-    # Then because we take the sum, we get the average by dividing by the number of samples
+    #   E[(L - <L>) * log_grads] = E[L * log_grads] - <L> * E[log_grads]
+    # where L = E_L + penalty_terms (with penalty_terms = 0 when lambda_virial = 0).
+    # Then because we take the sum, we get the average by dividing by the number of samples.
     avg_loss_term = loss_term_sum / num_samples
     mean_loss_grads = jax.tree.map(
         lambda w, g: (w / num_samples) - avg_loss_term * (g / num_samples),

@@ -4,53 +4,145 @@ import jax.numpy as jnp
 import optax
 from jaxtyping import Array, Key
 from flax import nnx
-from .utils import Nucleus, Electron, reduce_vmap, clip_grad_elementwise, clip_grad_global
+from .utils import Nucleus, Electron, clip_by_global_norm
 from .electronic_optimization import WaveFunction, sample_from_wavefunction, hamiltonian
 import einops
 from functools import partial
 import plotly.graph_objects as go
 
 
-def nuclei_energy_grad_full(wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
+def nuclei_energy_grad_full(
+    wave_function: WaveFunction,
+    electron_samples: Electron,
+    nuclei: Nucleus,
+    key: Key,
+    *,
+    batch_size: int = 50,
+    max_norm: float = 10.0,
+) -> Array:
+    """
+    Compute the unbiased VMC nuclear energy gradient:
+        grad_R <E> = E[grad_R E_L] + 2 * E[(E_L - <E_L>) * grad_R log|psi|]
+    where the second term is the Pulay / score-function contribution arising from
+    the R-dependence of the sampling distribution |psi(x; R)|^2.
+    """
     chex.assert_shape(electron_samples.position, (None, None, 3))
     chex.assert_shape(nuclei.position, (None, 3))
 
-    # @clip_grad_elementwise(-1.0, 1.0)
-    @clip_grad_global(max_norm=10.0)
-    def hamiltonian_grad(
-        nuclei_positions: Array,  # Gradient wrt. nuclei positions
-        wave_func_graphdef: WaveFunction,
-        wave_func_state: WaveFunction,
+    def hamiltonian_energy(
+        nuclei_positions: Array,
+        wf: WaveFunction,
         electron_sample: Electron,
         nuclei_charges: Array,
-        key: Key
-    ):
+        sample_key: Key,
+    ) -> Array:
         chex.assert_shape(electron_sample.position, (None, 3))
         chex.assert_shape(nuclei_positions, (None, 3))
-        wave_function = nnx.merge(wave_func_graphdef, wave_func_state)
-        nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
-        energy, _details = hamiltonian(wave_function, electron_sample, nuclei, key)
+        nuclei_obj = Nucleus(position=nuclei_positions, charge=nuclei_charges)
+        energy, _details = hamiltonian(wf, electron_sample, nuclei_obj, sample_key)
         return energy
 
-    zero_grads = jnp.zeros_like(nuclei.position)
-    @reduce_vmap(in_axes=(None, 0, None, None, 0), out_axes=0, init=zero_grads, reduce_fn=jnp.sum, acc_fn=jnp.add, batch_size=50)
-    def energy_grad(
-        wave_function: WaveFunction,
+    def log_abs_psi(
+        nuclei_positions: Array,
+        wf: WaveFunction,
+        electron_sample: Electron,
+        nuclei_charges: Array,
+    ) -> Array:
+        nuclei_obj = Nucleus(position=nuclei_positions, charge=nuclei_charges)
+        log_psi, _sign, _ortho_measure = wf(electron_sample, nuclei_obj)
+        return log_psi
+
+    energy_val_and_grad_fn = nnx.value_and_grad(hamiltonian_energy, argnums=0)
+    log_psi_grad_fn = nnx.grad(log_abs_psi, argnums=0)
+
+    def per_sample(
+        wf: WaveFunction,
         electron_sample: Electron,
         nuclei_positions: Array,
         nuclei_charges: Array,
-        key: Key
-    ) -> Array:
-        wave_func_graphdef, wave_func_state = nnx.split(wave_function)
-        energy_grad_fn = jax.grad(hamiltonian_grad)
-        # print(f"Nuclei positions: {nuclei_positions}")
-        energy_grad = energy_grad_fn(nuclei_positions, wave_func_graphdef, wave_func_state, electron_sample, nuclei_charges, key)
-        return energy_grad
+        sample_key: Key,
+    ):
+        local_energy, energy_grad = energy_val_and_grad_fn(
+            nuclei_positions, wf, electron_sample, nuclei_charges, sample_key
+        )
+        energy_grad = clip_by_global_norm(energy_grad, max_norm=max_norm)
 
-    hamiltonian_keys = jax.random.split(key, electron_samples.position.shape[0])
-    # Differentiate wrt nuclei_positions
-    grad = energy_grad(wave_function, electron_samples, nuclei.position, nuclei.charge, hamiltonian_keys)
-    return grad / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean energy gradient divide by the number of samples
+        log_psi_grad = log_psi_grad_fn(
+            nuclei_positions, wf, electron_sample, nuclei_charges
+        )
+        log_psi_grad = clip_by_global_norm(log_psi_grad, max_norm=max_norm)
+
+        weighted_log_psi_grad = local_energy * log_psi_grad
+        return energy_grad, weighted_log_psi_grad, log_psi_grad, local_energy
+
+    def sum_batch(
+        wf: WaveFunction,
+        batch_samples: Electron,
+        nuclei_positions: Array,
+        nuclei_charges: Array,
+        batch_keys: Key,
+    ):
+        energy_grads, weighted_log_psi_grads, log_psi_grads, local_energies = nnx.vmap(
+            per_sample, in_axes=(None, 0, None, None, 0)
+        )(wf, batch_samples, nuclei_positions, nuclei_charges, batch_keys)
+        return (
+            jnp.sum(energy_grads, axis=0),
+            jnp.sum(weighted_log_psi_grads, axis=0),
+            jnp.sum(log_psi_grads, axis=0),
+            jnp.sum(local_energies, axis=0),
+        )
+
+    @nnx.scan(in_axes=(None, nnx.Carry, 0, None, None, 0), out_axes=nnx.Carry)
+    def scan_step(
+        wf: WaveFunction,
+        carry,
+        batch_samples: Electron,
+        nuclei_positions: Array,
+        nuclei_charges: Array,
+        batch_keys: Key,
+    ):
+        batch_sums = sum_batch(wf, batch_samples, nuclei_positions, nuclei_charges, batch_keys)
+        return jax.tree.map(jnp.add, carry, batch_sums)
+
+    num_samples = electron_samples.position.shape[0]
+    hamiltonian_keys = jax.random.split(key, num_samples)
+
+    effective_batch_size = min(batch_size, num_samples)
+    num_full_batches = num_samples // effective_batch_size
+    num_full_samples = num_full_batches * effective_batch_size
+
+    init_grad = jnp.zeros_like(nuclei.position)
+    init_carry = (init_grad, init_grad, init_grad, jnp.array(0.0, dtype=nuclei.position.dtype))
+
+    full_samples = jax.tree.map(
+        lambda x: x[:num_full_samples].reshape((num_full_batches, effective_batch_size) + x.shape[1:]),
+        electron_samples,
+    )
+    full_keys = hamiltonian_keys[:num_full_samples].reshape(
+        (num_full_batches, effective_batch_size) + hamiltonian_keys.shape[1:]
+    )
+    energy_grad_sum, weighted_log_psi_grad_sum, log_psi_grad_sum, local_energy_sum = scan_step(
+        wave_function, init_carry, full_samples, nuclei.position, nuclei.charge, full_keys
+    )
+
+    if num_full_samples < num_samples:
+        rem_samples = jax.tree.map(lambda x: x[num_full_samples:], electron_samples)
+        rem_keys = hamiltonian_keys[num_full_samples:]
+        rem_sums = sum_batch(wave_function, rem_samples, nuclei.position, nuclei.charge, rem_keys)
+        energy_grad_sum, weighted_log_psi_grad_sum, log_psi_grad_sum, local_energy_sum = jax.tree.map(
+            jnp.add,
+            (energy_grad_sum, weighted_log_psi_grad_sum, log_psi_grad_sum, local_energy_sum),
+            rem_sums,
+        )
+
+    mean_energy_grad = energy_grad_sum / num_samples
+    mean_local_energy = local_energy_sum / num_samples
+    mean_weighted_log_psi_grad = weighted_log_psi_grad_sum / num_samples
+    mean_log_psi_grad = log_psi_grad_sum / num_samples
+
+    # Use linearity of expectation: E[(E_L - <E_L>) * g] = E[E_L * g] - <E_L> * E[g]
+    pulay_grad = 2.0 * (mean_weighted_log_psi_grad - mean_local_energy * mean_log_psi_grad)
+    return mean_energy_grad + pulay_grad
 
 
 def simplified_hamiltonian(electrons: Electron, nuclei: Nucleus):
@@ -76,7 +168,15 @@ def simplified_hamiltonian(electrons: Electron, nuclei: Nucleus):
     return nucleus_electron_interaction + nuclea_interaction
 
 
-def nuclei_energy_grad_hellmann_feynman(_wave_function: WaveFunction, electron_samples: Electron, nuclei: Nucleus, key: Key):
+def nuclei_energy_grad_hellmann_feynman(
+    _wave_function: WaveFunction,
+    electron_samples: Electron,
+    nuclei: Nucleus,
+    key: Key,
+    *,
+    batch_size: int = 100,
+    max_norm: float = 10.0,
+) -> Array:
     """
     According to the Hellmann-Feynman theorem (https://en.wikipedia.org/wiki/Hellmann–Feynman_theorem),
     the force on the nuclei can be calculated only considering the classical columb forces between the nuclei and the electrons,
@@ -88,35 +188,44 @@ def nuclei_energy_grad_hellmann_feynman(_wave_function: WaveFunction, electron_s
     chex.assert_shape(electron_samples.position, (None, None, 3))
     chex.assert_shape(nuclei.position, (None, 3))
 
-    @clip_grad_global(max_norm=10.0)
-    def hamiltonian_grad(
-        nuclei_positions: Array,  # Gradient wrt. nuclei positions
+    def hamiltonian_energy(
+        nuclei_positions: Array,
         electron_sample: Electron,
         nuclei_charges: Array,
     ):
         chex.assert_shape(electron_sample.position, (None, 3))
         chex.assert_shape(nuclei_positions, (None, 3))
-        nuclei = Nucleus(position=nuclei_positions, charge=nuclei_charges)
-        energy = simplified_hamiltonian(electron_sample, nuclei)
-        return energy
+        nuclei_obj = Nucleus(position=nuclei_positions, charge=nuclei_charges)
+        return simplified_hamiltonian(electron_sample, nuclei_obj)
 
-    zero_grads = jnp.zeros_like(nuclei.position)
-    @reduce_vmap(in_axes=(0, None, None), out_axes=0, init=zero_grads, reduce_fn=jnp.sum, acc_fn=jnp.add, batch_size=100)
-    def energy_grad(
-        electron_sample: Electron,
-        nuclei_positions: Array,
-        nuclei_charges: Array,
-    ) -> Array:
-        energy_grad_fn = jax.grad(hamiltonian_grad)
-        print(f"Nuclei positions: {nuclei_positions}")
-        print(f"Nuclei charges: {nuclei_charges}")
-        print(f"Electron samples: {electron_sample}")
-        energy_grad = energy_grad_fn(nuclei_positions, electron_sample, nuclei_charges)
-        return energy_grad
+    energy_grad_fn = jax.grad(hamiltonian_energy, argnums=0)
 
-    # Differentiate wrt nuclei_positions
-    grad = energy_grad(electron_samples, nuclei.position, nuclei.charge)
-    return grad / electron_samples.position.shape[0]  # We reduce by sum, so to get the mean energy gradient divide by the number of samples
+    def per_sample(electron_sample: Electron) -> Array:
+        grad = energy_grad_fn(nuclei.position, electron_sample, nuclei.charge)
+        return clip_by_global_norm(grad, max_norm=max_norm)
+
+    num_samples = electron_samples.position.shape[0]
+    effective_batch_size = min(batch_size, num_samples)
+    num_full_batches = num_samples // effective_batch_size
+    num_full_samples = num_full_batches * effective_batch_size
+
+    init_grad = jnp.zeros_like(nuclei.position)
+
+    def scan_step(acc, batch_samples):
+        batch_grads = jax.vmap(per_sample)(batch_samples)
+        return acc + jnp.sum(batch_grads, axis=0), None
+
+    full_samples = jax.tree.map(
+        lambda x: x[:num_full_samples].reshape((num_full_batches, effective_batch_size) + x.shape[1:]),
+        electron_samples,
+    )
+    grad_sum, _ = jax.lax.scan(scan_step, init_grad, full_samples)
+
+    if num_full_samples < num_samples:
+        rem_samples = jax.tree.map(lambda x: x[num_full_samples:], electron_samples)
+        grad_sum = grad_sum + jnp.sum(jax.vmap(per_sample)(rem_samples), axis=0)
+
+    return grad_sum / num_samples
 
 
 @nnx.jit(static_argnames=["num_electron_samples", "num_electron_chains", "sum_of_charges", "optimizer"])
