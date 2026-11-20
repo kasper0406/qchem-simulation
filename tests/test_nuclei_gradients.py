@@ -1,12 +1,14 @@
 import jax
 import jax.numpy as jnp
 import jax.scipy.special as jspecial
+import optax
 from flax import nnx
 
 from qchem_simulation.electronic_optimization import WaveFunction
 from qchem_simulation.nuclei_optimization import (
     nuclei_energy_grad_full,
     nuclei_energy_grad_hellmann_feynman,
+    sample_and_optimize,
 )
 from qchem_simulation.utils import Electron, Nucleus
 
@@ -144,7 +146,7 @@ def test_full_grad_clipping_not_distorted_by_electron_grad():
     assert jnp.allclose(grad, expected, atol=1e-4, rtol=1e-4)
 
 
-def test_full_grad_matches_finite_difference_with_pulay_term():
+def test_full_grad_matches_finite_difference_with_pulay_term(monkeypatch):
     """
     Verify nuclei_energy_grad_full matches finite-difference d<E(R)>/dR on an analytical
     R-dependent Gaussian wavefunction centered at nucleus 0 in a 2-nucleus system.
@@ -169,15 +171,19 @@ def test_full_grad_matches_finite_difference_with_pulay_term():
     spins = jnp.ones((2 * half_n, 1, 1), dtype=jnp.float32)
     electron_samples = Electron(position=pos, spin=spins)
 
-    # Use a large max_norm so rare tail samples don't bias the analytical MC comparison.
-    mc_grad = nuclei_energy_grad_full(
-        wf,
-        electron_samples,
-        nuclei,
-        jax.random.key(7),
-        batch_size=200,
-        max_norm=1e6,
+    # Feed exact samples into the geometry driver to isolate the gradient from MCMC error.
+    def exact_sampler(**kwargs):
+        samples = jax.tree.map(lambda x: x[:, None, ...], electron_samples)
+        return samples, None, None
+
+    monkeypatch.setattr("qchem_simulation.nuclei_optimization.sample_from_wavefunction", exact_sampler)
+    optimizer = optax.sgd(1.0)
+    updated_nuclei, _ = sample_and_optimize(
+        wf, optimizer, optimizer.init(nuclei.position), nuclei,
+        num_electron_samples=2 * half_n, num_electron_chains=1,
+        sum_of_charges=1, key=jax.random.key(7),
     )
+    mc_grad = nuclei.position - updated_nuclei.position
 
     fd_grad = _finite_diff_grad(
         lambda r: _exact_gaussian_2nuclei_energy(r, nuclei.charge, alpha),
@@ -188,7 +194,7 @@ def test_full_grad_matches_finite_difference_with_pulay_term():
     # Confirm the Pulay contribution is large (naive E[grad_R E_L] on R_0_z is +1/1.5^2 = +0.4444).
     assert abs(float(fd_grad[0, 2]) - (1.0 / 1.5**2)) > 0.3
 
-    # Full unbiased estimator must match finite-difference d<E>/dR closely.
+    # The default geometry update should match finite-difference d<E>/dR closely.
     assert jnp.allclose(mc_grad, fd_grad, atol=2e-2, rtol=5e-2), (
         f"MC grad {mc_grad} did not match finite-difference grad {fd_grad}"
     )
