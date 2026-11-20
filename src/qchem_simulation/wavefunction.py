@@ -302,10 +302,15 @@ class OrbitalHead(nnx.Module):
         return self.dense(x)
 
 
-# The following constructs a wave function using a neural network, following the
-# terminology described by https://en.wikipedia.org/wiki/Slater_determinant#Multi-particle_case
-# Split the Slater determinant into one block for each spin (det(Phi^up) * det(Phi^down)),
-# as interchanging electrons of opposite spin does not induce anti-symmetry.
+def spin_up_count(num_electrons: int, num_up: Optional[int]) -> int:
+    """Resolve the fixed spin population shared by the model and sampler."""
+    if num_up is None:
+        return (num_electrons + 1) // 2
+    if not (0 <= num_up <= num_electrons):
+        raise ValueError(f"num_up ({num_up}) must be between 0 and num_electrons ({num_electrons}).")
+    return num_up
+
+
 class OrbitalNetwork(nnx.Module):
     def __init__(
         self,
@@ -315,12 +320,7 @@ class OrbitalNetwork(nnx.Module):
         rngs: nnx.Rngs,
         num_up: Optional[int] = None,
     ):
-        if num_up is None:
-            num_up = (num_electrons + 1) // 2
-        if not (0 <= num_up <= num_electrons):
-            raise ValueError(
-                f"num_up ({num_up}) must be between 0 and num_electrons ({num_electrons})."
-            )
+        num_up = spin_up_count(num_electrons, num_up)
 
         self.num_electrons = num_electrons
         self.num_up = num_up
@@ -392,7 +392,11 @@ class SlaterDeterminant(nnx.Module):
             dtype = jnp.float32
 
         total_logabsdet = jnp.zeros((), dtype=dtype)
-        total_sign = jnp.ones((), dtype=dtype)
+        # Regrouping labeled electrons into up and down blocks permutes rows.
+        # Each down electron preceding an up electron contributes one inversion.
+        is_up = spins[:, 0] > 0
+        inversions = jnp.sum(jnp.where(is_up, jnp.cumsum(~is_up), 0))
+        total_sign = jnp.where(inversions % 2 == 0, 1, -1).astype(dtype)
 
         if up_orbitals is not None:
             up_det = jnp.linalg.slogdet(up_orbitals, method="qr")
@@ -404,7 +408,13 @@ class SlaterDeterminant(nnx.Module):
             total_logabsdet = total_logabsdet + down_det.logabsdet
             total_sign = total_sign * down_det.sign
 
-        return total_logabsdet, total_sign, orthonormality_measure
+        # A fixed-sector state has zero amplitude for every other spin population.
+        in_sector = jnp.sum(is_up) == self.orbital_network.num_up
+        return (
+            jnp.where(in_sector, total_logabsdet, -jnp.inf),
+            jnp.where(in_sector, total_sign, 0),
+            orthonormality_measure,
+        )
 
 
 class CuspElectrons(nnx.Module):
@@ -589,12 +599,7 @@ class WaveFunction(nnx.Module):
         rngs: nnx.Rngs,
         num_up: Optional[int] = None,
     ):
-        if num_up is None:
-            num_up = (num_electrons + 1) // 2
-        if not (0 <= num_up <= num_electrons):
-            raise ValueError(
-                f"num_up ({num_up}) must be between 0 and num_electrons ({num_electrons})."
-            )
+        num_up = spin_up_count(num_electrons, num_up)
 
         self.num_electrons = num_electrons
         self.num_nuclei = num_nuclei
@@ -649,7 +654,10 @@ class WaveFunction(nnx.Module):
         envelope = self.envelope(distances.electron_nuclei_distances.magnitude)
         result = self.jastrow_factor(distances, nuclei.charge, electrons.spin, self.distance_encoders) + slaters_sum + envelope
 
-        return result.squeeze(), sign, jnp.mean(orthonormality_measures)  # Ensure we return a scalar
+        # The signed-log reducer regularizes spatial nodes; an excluded spin
+        # sector is exactly zero independent of the electron positions.
+        in_sector = jnp.sum(electrons.spin > 0) == self.num_up
+        return jnp.where(in_sector, result.squeeze(), -jnp.inf), sign, jnp.mean(orthonormality_measures)
 
     def eval_wrt_electron_position(self, position: Array, nuclei: Nucleus, position_index: int, all_positions: Array, spins: Array) -> Array:
         """

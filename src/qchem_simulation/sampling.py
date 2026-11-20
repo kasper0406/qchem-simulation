@@ -10,18 +10,21 @@ import jax.numpy as jnp
 from jaxtyping import Array, Key
 
 from .utils import Electron, Nucleus, clip_grad_global
-from .wavefunction import WaveFunction
+from .wavefunction import WaveFunction, spin_up_count
 
 
-@nnx.jit(static_argnames=["sum_of_charges", "num_chains"])
-def init_electrons(nuclei: Nucleus, num_chains: int, rng: Key, sum_of_charges: int) -> Electron:
+@nnx.jit(static_argnames=["sum_of_charges", "num_chains", "num_up"])
+def init_electrons(
+    nuclei: Nucleus, num_chains: int, rng: Key, sum_of_charges: int, num_up: int | None = None
+) -> Electron:
     """
-    Initializes electrons around nuclei with random positions and spins.
+    Initializes electrons around nuclei with random positions in a fixed spin sector.
 
     Args:
         nuclei: A list of Nucleus objects.
         num_chains: The number of simulation chains.
         rng: A JAX random key.
+        num_up: Number of up spins. Defaults to half the electron count rounded up.
 
     Returns:
         An Electron object with initialized positions and spins.
@@ -30,20 +33,20 @@ def init_electrons(nuclei: Nucleus, num_chains: int, rng: Key, sum_of_charges: i
     num_electrons = sum_of_charges
     positions = jnp.repeat(nuclei.position, nuclei.charge.astype(jnp.int32), axis=0, total_repeat_length=num_electrons)
 
-    # Split the random key for position and spin generation.
-    pos_rng, spin_rng = jax.random.split(rng)
+    pos_rng, _ = jax.random.split(rng)
 
     # Generate random positions around the nuclei for each chain.
     # The positions are created with a shape of (num_chains, num_electrons, 3).
     sigma = 0.2  # Standard deviation for the normal distribution around each nucleus
     positions = jnp.expand_dims(positions, axis=0) + sigma * jax.random.normal(pos_rng, shape=(num_chains, num_electrons, 3))
 
-    # For now the spins are not being changed in the MCMC walk, we will initialize it to -1, 1 in an alternating way
-    spins = jnp.tile(((-1.0) ** jnp.arange(num_electrons))[None, :, None], (num_chains, 1, 1))
-    # Generate random spins for each electron in each chain.
-    # spins = jax.random.choice(spin_rng, jnp.array([-1, 1]), shape=(num_chains, num_electrons))
-
-    # print(f"Positions shape: {positions.shape}, Spins shape: {spins.shape}")
+    num_up = spin_up_count(num_electrons, num_up)
+    num_down = num_electrons - num_up
+    index = jnp.arange(num_electrons)
+    # Alternate through the paired spins and append the unpaired majority.
+    paired = index < 2 * min(num_up, num_down)
+    is_up = jnp.where(paired, index % 2 == 0, num_up > num_down)
+    spins = jnp.broadcast_to(jnp.where(is_up, 1.0, -1.0)[None, :, None], (num_chains, num_electrons, 1))
     return Electron(position=positions, spin=spins)
 
 
@@ -138,7 +141,10 @@ def sample_from_wavefunction(
 ):
     init_electrons_key, perm_key, step_key = jax.random.split(key, 3)
 
-    initial_positions = init_electrons(nuclei, num_chains=num_chains, rng=init_electrons_key, sum_of_charges=sum_of_charges)
+    initial_positions = init_electrons(
+        nuclei, num_chains=num_chains, rng=init_electrons_key, sum_of_charges=sum_of_charges,
+        num_up=getattr(wave_function, "num_up", None),
+    )
     chex.assert_shape(initial_positions.position, (num_chains, sum_of_charges, 3))
     num_electrons = initial_positions.position.shape[1]
 

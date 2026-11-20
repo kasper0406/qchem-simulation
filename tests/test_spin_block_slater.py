@@ -81,7 +81,7 @@ def test_same_spin_swap_flips_sign():
         chex.assert_trees_all_close(swapped_ortho, orig_ortho, rtol=1e-4, atol=1e-5)
 
 
-def test_opposite_spin_swap_preserves_sign():
+def test_opposite_spin_label_swap_flips_sign():
     num_electrons = 5
     num_nuclei = 2
     hdim = 8
@@ -97,7 +97,7 @@ def test_opposite_spin_swap_preserves_sign():
     dist = calculate_distances(electron_positions, nucleus_positions)
     orig_logdet, orig_sign, orig_ortho = slater_det(dist, spins, distance_encoders=distance_encoders)
 
-    # Opposite-spin pairs: swapping both positions and spins preserves sign (+1)
+    # Swapping both positions and spins exchanges complete electron labels.
     for i, j in [(0, 1), (0, 3), (1, 2), (1, 4), (3, 4)]:
         swapped_positions = electron_positions.at[[i, j], :].set(electron_positions[[j, i], :])
         swapped_spins = spins.at[[i, j], :].set(spins[[j, i], :])
@@ -106,7 +106,7 @@ def test_opposite_spin_swap_preserves_sign():
             swapped_dist, swapped_spins, distance_encoders=distance_encoders
         )
         chex.assert_trees_all_close(swapped_logdet, orig_logdet, rtol=1e-4, atol=1e-5)
-        chex.assert_trees_all_close(swapped_sign, orig_sign, rtol=1e-4, atol=1e-5)
+        chex.assert_trees_all_close(swapped_sign, -orig_sign, rtol=1e-4, atol=1e-5)
         chex.assert_trees_all_close(swapped_ortho, orig_ortho, rtol=1e-4, atol=1e-5)
 
 
@@ -251,3 +251,19 @@ def test_wavefunction_default_num_up_matches_init_electrons():
     assert jnp.isfinite(log_psi)
     assert float(jnp.abs(sign)) == pytest.approx(1.0, abs=1e-5)
     assert jnp.isfinite(ortho)
+
+@pytest.mark.parametrize("num_up", [0, 1, 3, 5])
+def test_initializer_sets_requested_population(num_up):
+    nuclei = Nucleus(position=jnp.zeros((1, 3)), charge=jnp.array([5.0]))
+    electrons = init_electrons(nuclei, 2, jax.random.key(1), 5, num_up=num_up)
+    assert jnp.all(jnp.sum(electrons.spin > 0, axis=1) == num_up)
+
+
+def test_wavefunction_has_zero_amplitude_outside_spin_sector():
+    nuclei = Nucleus(position=jnp.zeros((1, 3)), charge=jnp.array([2.0]))
+    electrons = init_electrons(nuclei, 1, jax.random.key(1), 2)
+    electrons = Electron(position=electrons.position[0], spin=electrons.spin[0])
+    wf = WaveFunction(2, 1, nnx.Rngs(0), num_up=2)
+    log_psi, sign, _ = nnx.jit(lambda model, e, n: model(e, n))(wf, electrons, nuclei)
+    assert jnp.isneginf(log_psi)
+    assert sign == 0
