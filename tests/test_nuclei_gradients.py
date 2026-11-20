@@ -9,6 +9,7 @@ from qchem_simulation.nuclei_optimization import (
     nuclei_energy_grad_full,
     nuclei_energy_grad_hellmann_feynman,
     sample_and_optimize,
+    simplified_hamiltonian,
 )
 from qchem_simulation.utils import Electron, Nucleus
 
@@ -243,3 +244,20 @@ def test_full_grad_works_with_neural_wavefunction_under_jit():
 
     assert grad.shape == (2, 3)
     assert jnp.all(jnp.isfinite(grad))
+
+
+@jax.enable_x64()
+def test_coulomb_geometry_derivative_near_and_at_contact():
+    electrons = Electron(position=jnp.zeros((1, 3)), spin=jnp.ones((1, 1)))
+
+    def energy(x):
+        nuclei = Nucleus(position=jnp.array([[x, 0.0, 0.0]]), charge=jnp.ones(1))
+        return simplified_hamiltonian(electrons, nuclei)
+
+    radius = 1e-8
+    value, gradient = jax.value_and_grad(energy)(radius)
+    assert jnp.isclose(value, -1 / radius, rtol=1e-12)
+    assert jnp.isclose(gradient, 1 / radius**2, rtol=1e-12)
+    contact_value, contact_gradient = jax.value_and_grad(energy)(0.0)
+    assert contact_value == -1e12
+    assert contact_gradient == 0
