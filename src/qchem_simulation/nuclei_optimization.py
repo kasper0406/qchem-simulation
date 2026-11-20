@@ -7,6 +7,7 @@ from flax import nnx
 from .utils import Nucleus, Electron, clip_by_global_norm
 from .electronic_optimization import WaveFunction, sample_from_wavefunction, hamiltonian
 import einops
+from typing import Literal
 from functools import partial
 import plotly.graph_objects as go
 
@@ -18,13 +19,15 @@ def nuclei_energy_grad_full(
     key: Key,
     *,
     batch_size: int = 50,
-    max_norm: float = 10.0,
+    max_norm: float | None = 10.0,
 ) -> Array:
     """
-    Compute the unbiased VMC nuclear energy gradient:
+    Estimate the VMC nuclear energy gradient:
         grad_R <E> = E[grad_R E_L] + 2 * E[(E_L - <E_L>) * grad_R log|psi|]
     where the second term is the Pulay / score-function contribution arising from
     the R-dependence of the sampling distribution |psi(x; R)|^2.
+    Pass max_norm=None to disable per-sample clipping, which biases the estimate
+    whenever the clipping threshold is exceeded.
     """
     chex.assert_shape(electron_samples.position, (None, None, 3))
     chex.assert_shape(nuclei.position, (None, 3))
@@ -65,12 +68,12 @@ def nuclei_energy_grad_full(
         local_energy, energy_grad = energy_val_and_grad_fn(
             nuclei_positions, wf, electron_sample, nuclei_charges, sample_key
         )
-        energy_grad = clip_by_global_norm(energy_grad, max_norm=max_norm)
-
         log_psi_grad = log_psi_grad_fn(
             nuclei_positions, wf, electron_sample, nuclei_charges
         )
-        log_psi_grad = clip_by_global_norm(log_psi_grad, max_norm=max_norm)
+        if max_norm is not None:
+            energy_grad = clip_by_global_norm(energy_grad, max_norm=max_norm)
+            log_psi_grad = clip_by_global_norm(log_psi_grad, max_norm=max_norm)
 
         weighted_log_psi_grad = local_energy * log_psi_grad
         return energy_grad, weighted_log_psi_grad, log_psi_grad, local_energy
@@ -175,7 +178,7 @@ def nuclei_energy_grad_hellmann_feynman(
     key: Key,
     *,
     batch_size: int = 100,
-    max_norm: float = 10.0,
+    max_norm: float | None = 10.0,
 ) -> Array:
     """
     According to the Hellmann-Feynman theorem (https://en.wikipedia.org/wiki/Hellmann–Feynman_theorem),
@@ -202,7 +205,9 @@ def nuclei_energy_grad_hellmann_feynman(
 
     def per_sample(electron_sample: Electron) -> Array:
         grad = energy_grad_fn(nuclei.position, electron_sample, nuclei.charge)
-        return clip_by_global_norm(grad, max_norm=max_norm)
+        if max_norm is not None:
+            grad = clip_by_global_norm(grad, max_norm=max_norm)
+        return grad
 
     num_samples = electron_samples.position.shape[0]
     effective_batch_size = min(batch_size, num_samples)
@@ -228,7 +233,10 @@ def nuclei_energy_grad_hellmann_feynman(
     return grad_sum / num_samples
 
 
-@nnx.jit(static_argnames=["num_electron_samples", "num_electron_chains", "sum_of_charges", "optimizer"])
+@nnx.jit(static_argnames=[
+    "num_electron_samples", "num_electron_chains", "sum_of_charges", "optimizer",
+    "gradient_method", "max_sample_grad_norm",
+])
 def sample_and_optimize(
     wave_function: WaveFunction,
     optimizer: optax.GradientTransformation,
@@ -238,7 +246,18 @@ def sample_and_optimize(
     num_electron_chains: int,
     sum_of_charges: int,
     key: Key,
+    *,
+    gradient_method: Literal["full", "hellmann_feynman"] = "full",
+    max_sample_grad_norm: float | None = None,
 ):
+    """Take a geometry step with the Pulay-corrected VMC gradient by default."""
+    if gradient_method == "full":
+        estimate_gradient = nuclei_energy_grad_full
+    elif gradient_method == "hellmann_feynman":
+        estimate_gradient = nuclei_energy_grad_hellmann_feynman
+    else:
+        raise ValueError(f"Unknown nuclear gradient method: {gradient_method!r}")
+
     sample_key, grad_key = jax.random.split(key, 2)
 
     electron_samples, _log_densities, _acceptance_rate = sample_from_wavefunction(
@@ -251,7 +270,9 @@ def sample_and_optimize(
     )
     electron_samples = jax.tree.map(lambda x: einops.rearrange(x, "n c ... -> (n c) ..."), electron_samples)
 
-    nuclei_grads = nuclei_energy_grad_hellmann_feynman(wave_function, electron_samples, nuclei, grad_key)
+    nuclei_grads = estimate_gradient(
+        wave_function, electron_samples, nuclei, grad_key, max_norm=max_sample_grad_norm
+    )
 
     updates, opt_state = optimizer.update(nuclei_grads, opt_state, nuclei.position)
     new_position = optax.apply_updates(nuclei.position, updates)
@@ -270,6 +291,9 @@ def optimize_nuclei(
     num_electron_samples: int,
     num_electron_chains: int,
     key: Key,
+    *,
+    gradient_method: Literal["full", "hellmann_feynman"] = "full",
+    max_sample_grad_norm: float | None = None,
 ):
     sum_of_charges = int(jnp.sum(nuclei.charge))
     step_keys = jax.random.split(key, num_steps)
@@ -285,6 +309,8 @@ def optimize_nuclei(
             num_electron_chains=num_electron_chains,
             sum_of_charges=sum_of_charges,
             key=step_key,
+            gradient_method=gradient_method,
+            max_sample_grad_norm=max_sample_grad_norm,
         )
 
         print(f"Nuclei positions {step + 1}: {nuclei.position}")
