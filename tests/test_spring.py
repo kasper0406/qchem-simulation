@@ -85,6 +85,24 @@ def test_minsr_matches_exact_primal_sr(num_samples, param_shapes):
     assert int(new_state.step) == 1
 
 
+def test_minsr_preserves_ridge_when_float32_gram_loses_damping():
+    O = jnp.array([[1000.0], [-1000.0]], dtype=jnp.float32)
+    epsilon = jnp.array([1.0, -1.0], dtype=O.dtype)
+    direction = jax.jit(compute_spring_direction)(O, epsilon, jnp.zeros(1), momentum=0.0)
+    expected = _primal_sr_direction(O, epsilon, damping=1e-3)
+    chex.assert_trees_all_close(direction, expected, rtol=1e-5, atol=1e-9)
+
+
+def test_nonfinite_proposal_preserves_params_and_momentum():
+    params = jnp.array([2.0])
+    state = SPRINGState(phi=jnp.array([0.3]), step=jnp.array(4))
+    scores = jnp.array([[-1.0], [1.0]])
+    next_params, next_state = jax.jit(spring_update)(
+        params, state, jnp.array([jnp.nan, 0.0]), scores
+    )
+    chex.assert_trees_all_equal((next_params, next_state), (params, state))
+
+
 def test_exact_factor_of_two_1d_harmonic_oscillator():
     """Verify exact factor-of-2 natural-gradient scale on the 1D harmonic oscillator.
 

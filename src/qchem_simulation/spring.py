@@ -1,5 +1,9 @@
 """SPRING and MinSR natural-gradient optimizers for Variational Monte Carlo (VMC).
 
+This experimental optimizer runs on a caller-supplied sample batch. Its dense
+score matrix has shape (num_samples, num_parameters) and the Gram matrix has
+shape (num_samples, num_samples).
+
 Implements:
 - **MinSR** (Chen & Heyl, 2024): Minimum-norm Stochastic Reconfiguration, which
   solves the dual ``N_s x N_s`` linear system instead of the primal ``P x P``
@@ -103,9 +107,23 @@ def compute_spring_direction(
     gram = 0.5 * (gram + gram.T)
     reg_gram = gram + damping * jnp.eye(num_samples, dtype=O.dtype)
 
-    cho_factor = jax.scipy.linalg.cho_factor(reg_gram, lower=True)
-    z = jax.scipy.linalg.cho_solve(cho_factor, eps_tilde)
-    return decayed_phi + O.T @ z
+    def spectral_correction():
+        # Work on O itself when squaring its condition number loses the ridge.
+        left, singular_values, right_t = jnp.linalg.svd(O, full_matrices=False)
+        lengths = jnp.hypot(singular_values, jnp.sqrt(damping))
+        ridge_weights = (singular_values / lengths) / lengths
+        return right_t.T @ (ridge_weights * (left.T @ eps_tilde))
+
+    def cholesky_correction():
+        factor = jax.scipy.linalg.cho_factor(reg_gram, lower=True)
+        z = jax.scipy.linalg.cho_solve(factor, eps_tilde)
+        correction = O.T @ z
+        return jax.lax.cond(
+            jnp.all(jnp.isfinite(correction)), lambda: correction, spectral_correction
+        )
+
+    ridge_visible = jnp.all(jnp.diag(reg_gram) > jnp.diag(gram))
+    return decayed_phi + jax.lax.cond(ridge_visible, cholesky_correction, spectral_correction)
 
 
 def spring_update(
@@ -138,7 +156,8 @@ def spring_update(
         eps: Small constant for numerical safety in norm clipping.
 
     Returns:
-        A tuple ``(new_params, new_state)``.
+        A tuple ``(new_params, new_state)``. A nonfinite proposal leaves both
+        parameters and state at their previous values.
     """
     flat_params, unravel_fn = jax.flatten_util.ravel_pytree(params)
     flat_log_grads = jax.vmap(lambda g: jax.flatten_util.ravel_pytree(g)[0])(per_sample_log_grads)
@@ -163,9 +182,11 @@ def spring_update(
         scale = jnp.minimum(1.0, max_norm / (step_norm + eps))
         delta_theta = delta_theta * scale
 
-    new_params = unravel_fn(flat_params - delta_theta)
-    new_state = SPRINGState(phi=phi, step=state.step + 1)
-    return new_params, new_state
+    proposed_params = flat_params - delta_theta
+    valid = jnp.all(jnp.isfinite(phi)) & jnp.all(jnp.isfinite(proposed_params))
+    next_params = jnp.where(valid, proposed_params, flat_params)
+    next_state = SPRINGState(phi=jnp.where(valid, phi, state.phi), step=state.step + valid)
+    return unravel_fn(next_params), next_state
 
 
 def compute_per_sample_log_grads(
