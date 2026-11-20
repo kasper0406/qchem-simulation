@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from dataclasses import dataclass, field
 from jaxtyping import Array, Key, ArrayLike
-from typing import List, Optional, Callable
+from typing import List, Literal, Optional, Callable
 import blackjax
 from flax import nnx
 import einops
@@ -37,8 +37,11 @@ class Distances:
     electron_nuclei_distances: Distance
 
 
-def calculate_kinetic_energy(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucleus) -> Array:
+def calculate_kinetic_energy_per_electron(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucleus) -> Array:
     """
+    Compute the local kinetic energy -0.5 * (∇^2 psi) / psi by vmapping
+    `folx.forward_laplacian` over each electron's 3D coordinates individually.
+
     Assumes wave_function returns the log-amplitude log(psi) of the wave function (returns both amplitude and sign).
     """
     from folx import forward_laplacian
@@ -70,6 +73,65 @@ def calculate_kinetic_energy(wave_function: "WaveFunction", electrons: Electron,
     terms = calc_terms(wave_function, electrons.position, position_indices)
     # print(f"Laplacian terms shape: {terms.shape}")
     return -0.5 * jnp.sum(terms)
+
+
+def calculate_kinetic_energy_full(
+    wave_function: "WaveFunction",
+    electrons: Electron,
+    nuclei: Nucleus,
+    sparsity_threshold: int | float = 0,
+) -> Array:
+    """
+    Compute the local kinetic energy -0.5 * (∇^2 psi) / psi in a single
+    `folx.forward_laplacian` pass over all 3N electron coordinates.
+
+    Assumes wave_function returns the log-amplitude log(psi) of the wave function (returns both amplitude and sign).
+    """
+    from folx import forward_laplacian
+
+    num_electrons = electrons.position.shape[0]
+    flat_positions = electrons.position.reshape(-1)
+    graphdef, state = nnx.split(wave_function)
+
+    def calc_wrt_positions(flat_pos: Array) -> Array:
+        wf = nnx.merge(graphdef, state)
+        elec = Electron(position=flat_pos.reshape(num_electrons, 3), spin=electrons.spin)
+        log_amplitude, _sign, _ortho_measure = wf(elec, nuclei)
+        return log_amplitude
+
+    laplacian = forward_laplacian(
+        calc_wrt_positions, sparsity_threshold=sparsity_threshold
+    )(flat_positions)
+
+    # Use the identity: (∇^2 psi)/psi = ∇^2 log|psi| + |∇ log|psi||^2
+    chex.assert_shape(laplacian.dense_jacobian, (3 * num_electrons,))
+    jacobian_squared = jnp.sum(laplacian.dense_jacobian ** 2)
+    return -0.5 * (laplacian.laplacian + jacobian_squared)
+
+
+def calculate_kinetic_energy(
+    wave_function: "WaveFunction",
+    electrons: Electron,
+    nuclei: Nucleus,
+    *,
+    method: Literal["full", "per_electron"] = "full",
+    sparsity_threshold: int | float = 0,
+) -> Array:
+    """
+    Compute the local kinetic energy -0.5 * (∇^2 psi) / psi.
+
+    Defaults to the full 3N forward Laplacian (`calculate_kinetic_energy_full`).
+    Pass `method="per_electron"` to use `calculate_kinetic_energy_per_electron`.
+    """
+    if method == "full":
+        return calculate_kinetic_energy_full(
+            wave_function, electrons, nuclei, sparsity_threshold=sparsity_threshold
+        )
+    if method == "per_electron":
+        return calculate_kinetic_energy_per_electron(wave_function, electrons, nuclei)
+    raise ValueError(
+        f"Unknown kinetic energy method: {method!r}. Expected 'full' or 'per_electron'."
+    )
 
 
 def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucleus, key: Key):
