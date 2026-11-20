@@ -47,6 +47,7 @@ from .wavefunction import (
     calculate_distances,
     calculate_pairwise_distances,
     slater_log_sum_exp,
+    slater_matrix_log_sum,
 )
 
 

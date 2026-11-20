@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from flax import nnx
+from folx import forward_laplacian
 
 from qchem_simulation.electronic_optimization import (
     Distance,
@@ -11,6 +12,7 @@ from qchem_simulation.electronic_optimization import (
     WaveFunction,
     hamiltonian,
     slater_log_sum_exp,
+    slater_matrix_log_sum,
 )
 from qchem_simulation.main import plot_nuclei_and_electrons
 from qchem_simulation.utils import Electron, Nucleus
@@ -139,6 +141,25 @@ def test_slater_log_sum_exp_singular_determinant():
     assert jnp.allclose(sign_psi, 1.0)
     assert bool(jnp.all(jnp.isfinite(grad_logs)))
     assert bool(jnp.all(jnp.isfinite(grad_coeffs)))
+
+
+@pytest.mark.parametrize("size,zeros", [(2, 1), (4, 1), (4, 2)])
+def test_slater_sum_derivatives_at_singular_orbital_matrix(size, zeros):
+    identity = jnp.eye(size)
+
+    def log_amplitude(x):
+        singular = identity.at[:zeros, :zeros].set(x * jnp.eye(zeros))
+        return slater_matrix_log_sum(jnp.stack((identity, singular)), jnp.ones(2))[0]
+
+    # The sum is 1+x or 1+x**2 depending on the nullity of the changing matrix.
+    expected_grad, expected_laplacian = (1.0, -1.0) if zeros == 1 else (0.0, 2.0)
+    x = jnp.array(0.0)
+    with jax.debug_nans(True):
+        result = forward_laplacian(log_amplitude)(x)
+        assert jnp.allclose(log_amplitude(x), 0.0)
+        assert jnp.allclose(jax.grad(log_amplitude)(x), expected_grad)
+        assert jnp.allclose(result.dense_jacobian, expected_grad)
+        assert jnp.allclose(result.laplacian, expected_laplacian)
 
 
 def test_slater_log_sum_exp_exact_cancellation_nodal_surface():

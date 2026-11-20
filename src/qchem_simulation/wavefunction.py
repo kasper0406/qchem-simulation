@@ -1,8 +1,6 @@
 """Neural Slater–Jastrow wavefunctions and their geometric features."""
 
 from dataclasses import dataclass
-from typing import List
-
 import chex
 from flax import nnx
 import jax
@@ -518,6 +516,49 @@ def slater_log_sum_exp(slater_logs, slater_signs, slater_coeffs):
     return log_psi_abs, sign_psi
 
 
+def _determinant_with_singular_derivatives(matrix: Array) -> Array:
+    """Evaluate a determinant with complete pivoting and a polynomial tail."""
+    factor = jnp.ones((), dtype=matrix.dtype)
+    for size in range(matrix.shape[0], 3, -1):
+        # Complete pivoting puts any nonzero entry on the diagonal.
+        pivot = jnp.argmax(jnp.abs(jax.lax.stop_gradient(matrix)))
+        row, col = pivot // size, pivot % size
+        indices = jnp.arange(size)
+        rows = indices.at[0].set(row).at[row].set(0)
+        cols = indices.at[0].set(col).at[col].set(0)
+        matrix = matrix[rows[:, None], cols[None, :]]
+        value = matrix[0, 0]
+        sign = jnp.where((row == 0) == (col == 0), 1, -1)
+        factor = factor * sign * value
+        denominator = jnp.where(value == 0, 1.0, value)
+        matrix = matrix[1:, 1:] - (matrix[1:, :1] / denominator) * matrix[:1, 1:]
+
+    # A polynomial tail preserves the derivatives used for kinetic energy
+    # and forces even when the determinant is zero.
+    if matrix.shape[0] == 3:
+        return factor * jnp.sum(matrix[0] * jnp.cross(matrix[1], matrix[2]))
+    if matrix.shape[0] == 2:
+        return factor * (matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0])
+    return matrix[0, 0]
+
+
+def slater_matrix_log_sum(orbitals: Array, coefficients: Array) -> tuple[Array, Array]:
+    """Return the signed log of a sum of determinants, including singular terms."""
+    row_scales = jnp.max(jnp.abs(orbitals), axis=-1, keepdims=True)
+    matrix_scales = jnp.max(row_scales, axis=-2, keepdims=True)
+    matrix_scales = jnp.where(matrix_scales > 0, matrix_scales, 1.0)
+    row_scales = jax.lax.stop_gradient(jnp.where(row_scales > 0, row_scales, matrix_scales))
+    log_scales = jnp.sum(jnp.log(row_scales[..., 0]), axis=-1)
+    shift = jnp.max(log_scales)
+    determinants = jax.vmap(_determinant_with_singular_derivatives)(orbitals / row_scales)
+    total = jnp.sum(coefficients * determinants * jnp.exp(log_scales - shift))
+    magnitude = jnp.abs(total)
+    tiny = jnp.finfo(total.dtype).tiny
+    valid = magnitude >= tiny
+    log_magnitude = jnp.where(valid, jnp.log(jnp.where(valid, magnitude, 1.0)), jnp.log(tiny))
+    return shift + log_magnitude, jnp.sign(total)
+
+
 class WaveFunction(nnx.Module):
     def __init__(self, num_electrons: int, num_nuclei: int, rngs: nnx.Rngs):
         self.num_electrons = num_electrons
@@ -554,24 +595,23 @@ class WaveFunction(nnx.Module):
 
         distances = calculate_distances(electrons.position, nuclei.position)
 
-        # @nnx.vmap(in_axes=(0, None, None, None), out_axes=(0, 0, 0))
-        # def calc_slater(slater: SlaterDeterminant, distances: Distances, spins: Array, distance_encoders: DistanceEncoders) -> Array:
-        #     return slater(distances, spins, distance_encoders=distance_encoders)
-        def calc_slater(slaters: List[SlaterDeterminant], distances: Distances, spins: Array, distance_encoders: DistanceEncoders) -> Array:
-            results = [slater(distances, spins, distance_encoders=distance_encoders) for slater in slaters]
-            slater_logs, slater_signs, orthonormality_measures = zip(*results)
-            # print(f"Slater logs: {slater_logs}")
-            # print(f"Slater signs: {slater_signs}")
-            # print(f"Orthonormality measures: {orthonormality_measures}")
-            return jnp.array(slater_logs), jnp.array(slater_signs), jnp.array(orthonormality_measures)
-
-        slater_logs, slater_signs, orthonormality_measures = calc_slater(self.slater_determinants, distances, electrons.spin, self.distance_encoders)
-        slaters_sum, sign = slater_log_sum_exp(slater_logs, slater_signs, self.slater_strengths)
+        if len(self.slater_determinants) == 1:
+            log_det, det_sign, ortho_measure = self.slater_determinants[0](
+                distances, electrons.spin, self.distance_encoders
+            )
+            slaters_sum, sign = slater_log_sum_exp(log_det, det_sign, self.slater_strengths)
+        else:
+            orbitals, measures = zip(*(
+                slater.orbital_network(distances, electrons.spin, self.distance_encoders)
+                for slater in self.slater_determinants
+            ))
+            slaters_sum, sign = slater_matrix_log_sum(jnp.stack(orbitals), self.slater_strengths[...])
+            ortho_measure = jnp.mean(jnp.stack(measures))
 
         envelope = self.envelope(distances.electron_nuclei_distances.magnitude)
         result = self.jastrow_factor(distances, nuclei.charge, electrons.spin, self.distance_encoders) + slaters_sum + envelope
 
-        return result.squeeze(), sign, jnp.mean(orthonormality_measures)  # Ensure we return a scalar
+        return result.squeeze(), sign, ortho_measure
 
     def eval_wrt_electron_position(self, position: Array, nuclei: Nucleus, position_index: int, all_positions: Array, spins: Array) -> Array:
         """
