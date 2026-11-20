@@ -729,7 +729,7 @@ def sample_from_wavefunction(
     mcmc_burnin_steps: int = 50,
     mcmc_thinning_factor: int = 2,
 ):
-    init_electrons_key, init_sampler_key, sample_key = jax.random.split(key, 3)
+    init_electrons_key, perm_key, step_key = jax.random.split(key, 3)
 
     initial_positions = init_electrons(nuclei, num_chains=num_chains, rng=init_electrons_key, sum_of_charges=sum_of_charges)
     chex.assert_shape(initial_positions.position, (num_chains, sum_of_charges, 3))
@@ -803,10 +803,10 @@ def sample_from_wavefunction(
         def _generate(key: Key) -> Array:
             return jax.random.permutation(key, jnp.arange(num_electrons))
         return _generate(jax.random.split(key, num_chains))
-    electron_permutations = generate_electron_permutation(jax.random.split(sample_key, num_samples))
+    electron_permutations = generate_electron_permutation(jax.random.split(perm_key, num_samples))
     chex.assert_shape(electron_permutations, (num_samples, num_chains, num_electrons))
 
-    step_keys = jax.random.split(key, num_samples)
+    step_keys = jax.random.split(step_key, num_samples)
     electron_position_samples, _last_position, log_densities, acceptance_rate = scan_num_samples(
         wave_function,
         electron_permutations,
