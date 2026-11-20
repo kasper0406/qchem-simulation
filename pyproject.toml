@@ -6,12 +6,13 @@ build-backend = "setuptools.build_meta"
 name = "qchem-simulation"
 version = "0.1.0"
 dependencies = [
-    "blackjax>=1.2.5",
+    "blackjax>=1.7.1",
+    "chex>=0.1.91",
     "einops>=0.8.1",
-    "flax>=0.11.1",
-    "folx>=0.2.19",
-    "jax>=0.7.0",
-    "jaxtyping>=0.3.2",
+    "flax>=0.12.12",
+    "folx>=0.2.31",
+    "jax>=0.12.1",
+    "jaxtyping>=0.3.11",
     "plotly>=6.3.0",
 ]
 

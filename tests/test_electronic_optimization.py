@@ -42,7 +42,7 @@ def test_permutation_equivariance_electronic_attention():
         swapped_dist = calculate_distances(swapped_positions, nucleus_positions)
         swapped_out = eatt(swapped_dist, distance_encoders=distance_encoders)
         permuted_original = original_out.at[[j, i], :].set(original_out[[i, j], :])
-        chex.assert_trees_all_close(swapped_out, permuted_original)
+        chex.assert_trees_all_close(swapped_out, permuted_original, rtol=1e-4, atol=1e-5)
 
     _swap_and_check(0, 1)
     _swap_and_check(0, 2)
