@@ -68,13 +68,17 @@ def test_permutation_of_slater_determinant():
     original_det, original_sign, _ortho_measure = slater_det(dist, spins, distance_encoders=distance_encoders)
 
     def _swap_and_check(i, j):
-        # Swap the position of electron i and j
+        # Swap the position and spin of electron i and j.
+        # With spin-block Slater determinants det(Phi^up) * det(Phi^down):
+        # - Swapping two same-spin electrons swaps two rows in one spin block -> flips sign (-1).
+        # - Swapping two opposite-spin electrons (in alternating spin order) preserves sign (+1).
         swapped_positions = electron_positions.at[[i, j], :].set(electron_positions[[j, i], :])
         swapped_dist = calculate_distances(swapped_positions, nucleus_positions)
         swapped_spins = spins.at[[i, j], ...].set(spins[[j, i], ...])
         swapped_det, swapped_sign, _ortho_measure = slater_det(swapped_dist, swapped_spins, distance_encoders=distance_encoders)
         chex.assert_trees_all_close(original_det, swapped_det, rtol=1e-4)
-        chex.assert_trees_all_close(original_sign, -swapped_sign, rtol=1e-4)  # Swapping two electrons will pick up a minus sign!
+        expected_sign = -original_sign if spins[i, 0] == spins[j, 0] else original_sign
+        chex.assert_trees_all_close(swapped_sign, expected_sign, rtol=1e-4)
 
     _swap_and_check(0, 1)
     _swap_and_check(0, 2)
