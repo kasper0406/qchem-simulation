@@ -339,3 +339,32 @@ def test_hydrogen_1s_2s_exact_nes_local_energy():
     )
     assert jnp.allclose(res.energies, jnp.array([-0.5, -0.125]), atol=1e-4)
     assert jnp.allclose(res.excitation_gaps, jnp.array([0.375]), atol=1e-4)
+
+
+def test_subspace_energy_is_invariant_to_state_rescaling_and_flags_rank_loss():
+    from qchem_simulation.excited_states import solve_generalized_eigenvalue
+
+    overlap = jnp.diag(jnp.array([1., 1e-12]))
+    hamiltonian = jnp.diag(jnp.array([0.5, 1.5e-12]))
+    energies, c = solve_generalized_eigenvalue(hamiltonian, overlap)
+    assert jnp.allclose(energies, jnp.array([0.5, 1.5]))
+    assert jnp.allclose(c.T @ overlap @ c, jnp.eye(2))
+    energies, c = solve_generalized_eigenvalue(jnp.ones((2, 2)), jnp.ones((2, 2)))
+    assert jnp.all(jnp.isnan(energies)) and jnp.all(jnp.isnan(c))
+
+
+def test_signed_action_at_individual_state_node():
+    def amplitudes(p, x, shift):
+        t = x[0]
+        return jnp.array([1., t + t*t + p]) * jnp.exp(-0.5*t*t - shift)
+
+    def log_sign(p, x):
+        return _signed_to_log_sign(amplitudes(p, x, 0.))
+
+    ansatz = MultiStateAnsatz(2, log_sign, scaled_amplitudes=amplitudes)
+    action = make_schrodinger_local_energy_fn(ansatz, _ho_1d_potential)
+    x = jnp.array([[0.], [1.]])
+    assert jnp.allclose(nes_local_energy(ansatz, 0., x, action), 2.5)
+    assert jnp.allclose(jax.grad(lambda p: ansatz.log_prob(p, x))(0.), 0.)
+    result = compute_excited_state_energies(ansatz, 0., x, action, log_proposal_prob=jnp.zeros(2))
+    assert jnp.all(jnp.isfinite(result.energies))

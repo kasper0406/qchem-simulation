@@ -83,17 +83,26 @@ class MultiStateAnsatz:
 
     Wraps a single-state evaluator ``single_state_fn(params, x) -> (log_abs, sign)``
     that returns arrays of shape ``(K,)`` for a single configuration ``x``.
+    For states that may vanish on sampled configurations, also supply
+    ``scaled_amplitudes(params, x, shift)``, a differentiable evaluation of
+    the signed amplitudes multiplied by exp(-shift). Factor the shift into
+    any exponential envelope before exponentiating to preserve dynamic range.
     """
 
     def __init__(
         self,
         num_states: int,
         single_state_fn: Callable[[Any, Array], tuple[Array, Array]],
+        *,
+        scaled_amplitudes: Callable[[Any, Array, Array], Array] | None = None,
     ) -> None:
         if num_states < 1:
             raise ValueError(f"num_states must be >= 1, got {num_states}")
         self.num_states = num_states
         self.single_state_fn = single_state_fn
+        # Optional smooth signed evaluator returning psi_i(x) * exp(-shift).
+        # Supply this to retain amplitude derivatives at individual state nodes.
+        self.scaled_amplitudes = scaled_amplitudes
 
     @classmethod
     def from_state_fns(
@@ -150,6 +159,10 @@ class MultiStateAnsatz:
         """
         log_abs_M, sign_M = self.eval_log_matrix(params, X)
         M_tilde, col_shifts = build_shifted_matrix(log_abs_M, sign_M)
+        if self.scaled_amplitudes is not None:
+            M_tilde = jax.vmap(self.scaled_amplitudes, in_axes=(None, 0, 0))(
+                params, X, col_shifts
+            ).T
         sign_det, log_abs_det_tilde = jnp.linalg.slogdet(M_tilde)
         log_abs_psi = log_abs_det_tilde + jnp.sum(col_shifts)
         return log_abs_psi, sign_det
@@ -165,6 +178,36 @@ class MultiStateAnsatz:
         return jax.scipy.special.logsumexp(2.0 * log_abs, axis=0)
 
 
+@dataclass
+class SignedHamiltonianAction:
+    """Local-energy adapter for a smooth numerator exp(-shift) * H psi(x).
+
+    Pass this adapter anywhere a local energy is accepted to evaluate matrix
+    elements even where an individual state vanishes.
+    """
+
+    ansatz: MultiStateAnsatz
+    numerator: Callable[[Any, Array, Array], Array]
+
+    def __call__(self, params: Any, x: Array) -> Array:
+        logs, signs = self.ansatz.eval_states(params, x)
+        shift = jax.lax.stop_gradient(jnp.max(logs))
+        shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
+        return self.numerator(params, x, shift) / (signs * jnp.exp(logs - shift))
+
+
+def _weighted_hamiltonian(local_energy_fn, params, samples, shifts, amplitudes):
+    """Evaluate rows of scaled H psi using the same scale as amplitudes."""
+    if isinstance(local_energy_fn, SignedHamiltonianAction):
+        return jax.vmap(local_energy_fn.numerator, in_axes=(None, 0, 0))(
+            params, samples, shifts
+        )
+    ratios = jax.vmap(local_energy_fn, in_axes=(None, 0))(params, samples)
+    # At a node H psi cannot be inferred from the ratio. Preserve undefined
+    # products instead of silently replacing a potentially nonzero numerator.
+    return ratios * amplitudes
+
+
 def make_schrodinger_local_energy_fn(
     ansatz: MultiStateAnsatz,
     potential_fn: Callable[[Array], Array],
@@ -173,6 +216,9 @@ def make_schrodinger_local_energy_fn(
 
     Computes E_{L, i}(x) = -1/2 * (nabla^2 log|psi_i(x)| + ||nabla log|psi_i(x)|||^2) + V(x)
     for all K states simultaneously via forward-over-reverse autodiff.
+    If the ansatz supplies smooth scaled amplitudes, this returns a
+    SignedHamiltonianAction that evaluates H psi directly in matrix elements.
+    The log-only path requires nonzero individual states at evaluation points.
 
     Args:
         ansatz: MultiStateAnsatz evaluating K states.
@@ -181,6 +227,17 @@ def make_schrodinger_local_energy_fn(
     Returns:
         A callable ``local_energy_fn(params, x) -> Array`` of shape ``(K,)``.
     """
+
+    if ansatz.scaled_amplitudes is not None:
+        def numerator(params: Any, x: Array, shift: Array) -> Array:
+            def amplitudes(flat: Array) -> Array:
+                return ansatz.scaled_amplitudes(params, flat.reshape(x.shape), shift)
+
+            flat = x.ravel()
+            hessian = jax.jacfwd(jax.jacrev(amplitudes))(flat)
+            return -0.5 * jnp.trace(hessian, axis1=-2, axis2=-1) + potential_fn(x) * amplitudes(flat)
+
+        return SignedHamiltonianAction(ansatz, numerator)
 
     def local_energy_fn(params: Any, x: Array) -> Array:
         orig_shape = x.shape
@@ -225,11 +282,8 @@ def nes_local_energy_matrix(
         K x K matrix L(X).
     """
     log_abs_M, sign_M = ansatz.eval_log_matrix(params, X)
-    M_tilde, _ = build_shifted_matrix(log_abs_M, sign_M)
-
-    # Evaluate single-state local energies at each configuration j: (K_configs, K_states) -> (K_states, K_configs)
-    E_L = jax.vmap(lambda x: local_energy_fn(params, x))(X).T
-    H_M_tilde = jnp.where(M_tilde == 0.0, 0.0, E_L * M_tilde)
+    M_tilde, shifts = build_shifted_matrix(log_abs_M, sign_M)
+    H_M_tilde = _weighted_hamiltonian(local_energy_fn, params, X, shifts, M_tilde.T).T
 
     # Solve M_tilde^T L^T = H_M_tilde^T  =>  L = H_M_tilde @ M_tilde^{-1}
     return jnp.linalg.solve(M_tilde.T, H_M_tilde.T).T
@@ -260,14 +314,7 @@ def nes_local_energy(
     Returns:
         Scalar total local energy E_L(X).
     """
-    log_abs_M, sign_M = ansatz.eval_log_matrix(params, X)
-    M_tilde, _ = build_shifted_matrix(log_abs_M, sign_M)
-
-    E_L = jax.vmap(lambda x: local_energy_fn(params, x))(X).T  # (K, K)
-    H_M_tilde = jnp.where(M_tilde == 0.0, 0.0, E_L * M_tilde)
-
-    # tr(M_tilde^{-1} H_M_tilde) via linear solve for numerical stability
-    return jnp.trace(jnp.linalg.solve(M_tilde, H_M_tilde))
+    return jnp.trace(nes_local_energy_matrix(ansatz, params, X, local_energy_fn))
 
 
 def nes_vmc_step(
@@ -345,13 +392,13 @@ def solve_generalized_eigenvalue(
 ) -> tuple[Array, Array]:
     """Solve the symmetric generalized eigenvalue problem H c = E S c.
 
-    Uses Löwdin / spectral whitening of S with eigenvalue floor ``reg`` for
-    numerical stability.
+    Normalizes each basis state before spectral whitening. A rank-deficient
+    overlap cannot yield K energies and returns NaNs for both outputs.
 
     Args:
         H: K x K Hamiltonian matrix (symmetrized internally).
         S: K x K positive semi-definite overlap matrix (symmetrized internally).
-        reg: Minimum eigenvalue floor for S^{-1/2}.
+        reg: Relative rank tolerance for the normalized overlap.
 
     Returns:
         (energies, eigenvectors) where energies are sorted ascending of shape (K,)
@@ -360,16 +407,19 @@ def solve_generalized_eigenvalue(
     H_sym = 0.5 * (H + H.T)
     S_sym = 0.5 * (S + S.T)
 
-    s_vals, s_vecs = jnp.linalg.eigh(S_sym)
-    s_vals_safe = jnp.maximum(s_vals, reg)
-    whitener = s_vecs * (1.0 / jnp.sqrt(s_vals_safe))[None, :]
-
+    norms = jnp.sqrt(jnp.diag(S_sym))
+    safe_norms = jnp.where(norms > 0, norms, 1.0)
+    normalized_overlap = (S_sym / safe_norms[:, None]) / safe_norms[None, :]
+    s_vals, s_vecs = jnp.linalg.eigh(normalized_overlap)
+    tolerance = jnp.maximum(reg, len(s_vals) * jnp.finfo(s_vals.dtype).eps)
+    full_rank = jnp.all(norms > 0) & (s_vals[0] > tolerance * s_vals[-1])
+    whitener = (s_vecs / safe_norms[:, None]) / jnp.sqrt(jnp.where(s_vals > 0, s_vals, 1.0))
     H_orth = whitener.T @ H_sym @ whitener
     H_orth = 0.5 * (H_orth + H_orth.T)
 
     energies, eigvecs_orth = jnp.linalg.eigh(H_orth)
     eigenvectors = whitener @ eigvecs_orth
-    return energies, eigenvectors
+    return jnp.where(full_rank, energies, jnp.nan), jnp.where(full_rank, eigenvectors, jnp.nan)
 
 
 def compute_excited_state_energies(
@@ -401,14 +451,13 @@ def compute_excited_state_energies(
             an array of shape (N,) or a callable x -> scalar. If None, assumes
             samples were drawn from the natural state mixture
             p(x) proportional to sum_k |psi_k(x)|^2.
-        reg: Eigenvalue floor for S in the generalized eigenvalue solve.
+        reg: Relative rank tolerance for the normalized overlap.
 
     Returns:
         ExcitedStateResult containing sorted energies, excitation gaps,
         eigenvectors, S, and H.
     """
     log_abs, signs = jax.vmap(lambda x: ansatz.eval_states(params, x))(samples)  # (N, K)
-    E_L = jax.vmap(lambda x: local_energy_fn(params, x))(samples)  # (N, K)
 
     if log_proposal_prob is None:
         log_p = jax.scipy.special.logsumexp(2.0 * log_abs, axis=-1)  # (N,)
@@ -424,7 +473,9 @@ def compute_excited_state_energies(
 
     n_samples = samples.shape[0]
     S = (psi_w.T @ psi_w) / n_samples
-    H_psi_w = jnp.where(psi_w == 0.0, 0.0, psi_w * E_L)
+    H_psi_w = _weighted_hamiltonian(
+        local_energy_fn, params, samples, 0.5 * log_p + global_shift, psi_w
+    )
     H_raw = (psi_w.T @ H_psi_w) / n_samples
     H = 0.5 * (H_raw + H_raw.T)
 
