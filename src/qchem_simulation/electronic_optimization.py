@@ -325,6 +325,8 @@ class FlatDistanceEncoder(nnx.Module):
         self.encoder = DistanceEncoder(hidden_dim, buckets, rngs, cutoff)
 
     def __call__(self, distances: Distance):
+        if distances.magnitude.shape[0] == 0:
+            return jnp.zeros((self.encoder.final_proj.out_features,), dtype=distances.magnitude.dtype)
         expanded = jax.tree.map(lambda x: x[None, :], distances)
         return self.encoder(expanded)[0]
 
@@ -522,26 +524,48 @@ def slater_log_sum_exp(slater_logs, slater_signs, slater_coeffs):
         - log_psi_abs: The log of the absolute value of the total wavefunction.
         - sign_psi: The sign (+1 or -1) of the total wavefunction.
     """
+    slater_logs = jnp.asarray(slater_logs)
+    slater_signs = jnp.asarray(slater_signs)
+    slater_coeffs = jnp.asarray(slater_coeffs)
+
+    dtype = jnp.result_type(slater_logs, slater_coeffs, jnp.float32)
+    eps = jnp.asarray(1e-12, dtype=dtype)
+
+    abs_coeffs = jnp.abs(slater_coeffs)
+    valid_mask = (abs_coeffs > 0) & jnp.isfinite(slater_logs)
+    safe_abs_coeffs = jnp.where(valid_mask, abs_coeffs, jnp.ones_like(abs_coeffs))
+    safe_logs = jnp.where(valid_mask, slater_logs, jnp.zeros_like(slater_logs))
+
     # Calculate the log-magnitude of each term in the expansion
     # log|T_i| = log|c_i| + log|D_i|
-    log_term_magnitudes = jnp.log(jnp.abs(slater_coeffs)) + slater_logs
+    log_term_magnitudes = jnp.log(safe_abs_coeffs) + safe_logs
 
-    # Find the dominant term's magnitude (the 'x_max' in the standard trick)
-    max_log_mag = jnp.max(log_term_magnitudes)
+    # Find the dominant term's magnitude among valid terms (the 'x_max' in the standard trick)
+    any_valid = jnp.any(valid_mask)
+    min_log_mag = jnp.min(log_term_magnitudes) - jnp.asarray(1.0, dtype=dtype)
+    masked_log_mags = jnp.where(valid_mask, log_term_magnitudes, min_log_mag)
+    max_log_mag = jnp.where(any_valid, jnp.max(masked_log_mags), jnp.asarray(0.0, dtype=dtype))
+    max_log_mag = jax.lax.stop_gradient(max_log_mag)
 
     # Calculate the sum of terms, normalized by the largest term to prevent overflow.
     # The value of each term in the sum is:
     # sign(c_i)*s_i*exp(log|c_i| + ld_i - max_log_mag)
-    sum_val = jnp.sum(
-        jnp.sign(slater_coeffs) * slater_signs * jnp.exp(log_term_magnitudes - max_log_mag)
+    scaled_exponents = jnp.where(valid_mask, log_term_magnitudes - max_log_mag, jnp.asarray(0.0, dtype=dtype))
+    terms = jnp.where(
+        valid_mask,
+        jnp.sign(slater_coeffs) * slater_signs * jnp.exp(scaled_exponents),
+        jnp.asarray(0.0, dtype=dtype),
     )
+    sum_val = jnp.sum(terms)
 
     # The final sign is the sign of this normalized sum
     sign_psi = jnp.sign(sum_val)
 
     # The final log-magnitude is the log of the dominant term's magnitude
     # plus the log of the absolute value of the normalized sum.
-    log_psi_abs = max_log_mag + jnp.log(jnp.abs(sum_val))
+    # Clamp |sum_val| away from 0 so nodal surfaces (sum_val == 0) yield finite values and gradients.
+    safe_abs_sum = jnp.maximum(jnp.abs(sum_val), eps)
+    log_psi_abs = max_log_mag + jnp.log(safe_abs_sum)
 
     return log_psi_abs, sign_psi
 
