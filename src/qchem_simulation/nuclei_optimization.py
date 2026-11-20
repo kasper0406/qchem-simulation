@@ -4,8 +4,10 @@ import jax.numpy as jnp
 import optax
 from jaxtyping import Array, Key
 from flax import nnx
+from .hamiltonian import electron_nucleus_attraction, hamiltonian, nucleus_nucleus_repulsion
+from .sampling import sample_from_wavefunction
 from .utils import Nucleus, Electron, clip_by_global_norm
-from .electronic_optimization import WaveFunction, sample_from_wavefunction, hamiltonian
+from .wavefunction import WaveFunction
 import einops
 from typing import Literal
 from functools import partial
@@ -156,19 +158,7 @@ def simplified_hamiltonian(electrons: Electron, nuclei: Nucleus):
     chex.assert_shape(electrons.position, (None, 3))
     chex.assert_shape(nuclei.position, (None, 3))
 
-    eps = 1e-12
-
-    nuclea_i, nuclea_j = jnp.triu_indices(nuclei.position.shape[0], k=1)
-    nuclei_charge = nuclei.charge[nuclea_i] * nuclei.charge[nuclea_j]
-    nuclei_distances = jnp.linalg.norm(nuclei.position[nuclea_i] - nuclei.position[nuclea_j], axis=-1)
-    nuclea_interaction = jnp.sum(nuclei_charge / (nuclei_distances + eps))
-
-    electron_nuclei_distances = jnp.linalg.norm(
-        electrons.position[:, None] - nuclei.position[None, :], axis=-1
-    )
-    nucleus_electron_interaction = -jnp.sum(nuclei.charge[None, :] / (electron_nuclei_distances + eps))
-
-    return nucleus_electron_interaction + nuclea_interaction
+    return electron_nucleus_attraction(electrons, nuclei) + nucleus_nucleus_repulsion(nuclei)
 
 
 def nuclei_energy_grad_hellmann_feynman(
