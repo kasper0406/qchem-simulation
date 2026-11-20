@@ -26,7 +26,8 @@ def plot_nuclei_and_electrons(
     num_electron_chains: int,
     num_electron_samples: int,
     nuclei: Nucleus,
-    key: Key
+    key: Key,
+    output_dir: str = "electron_samples",
 ):
     sum_of_charges = int(jnp.sum(nuclei.charge))
     electron_samples, _log_densities, _acceptance_rate = sample_from_wavefunction(
@@ -66,7 +67,8 @@ def plot_nuclei_and_electrons(
         legend=dict(title='Molecule')
     )
     # fig.show(renderer="jupyterlab")
-    fig.write_html(f"electron_samples/step_{step}.html")
+    os.makedirs(output_dir, exist_ok=True)
+    fig.write_html(os.path.join(output_dir, f"step_{step}.html"))
 
 
 def main(_args):
@@ -110,9 +112,9 @@ def main(_args):
 
         electronic_steps = 25 # 100
         nuclei_steps = 1
-        num_chains = 50
+        num_chains = 25
         num_electronic_samples = 250
-        num_nuclei_samples = 650
+        num_nuclei_samples = 450
 
         train_wavefunction(
             wave_function,
@@ -171,6 +173,6 @@ if __name__ == "__main__":
     )
 
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-    jax.threefry_partitionable(True)
+    jax.config.update("jax_threefry_partitionable", True)
 
     app.run(main)
