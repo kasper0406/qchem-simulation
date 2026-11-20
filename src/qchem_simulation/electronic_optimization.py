@@ -160,10 +160,10 @@ class TransformerStack(nnx.Module):
         #     return TransformerLayer(num_heads=num_heads, hidden_dim=hidden_dim, rngs=rng)
 
         # self.layers = create_layer(rngs)
-        self.layers = []
-        for _ in range(num_layers):
-            layer = TransformerLayer(num_heads=num_heads, hidden_dim=hidden_dim, rngs=rngs)
-            self.layers.append(layer)
+        self.layers = nnx.List([
+            TransformerLayer(num_heads=num_heads, hidden_dim=hidden_dim, rngs=rngs)
+            for _ in range(num_layers)
+        ])
 
     def __call__(self, key_values: Array, query: Array | None = None) -> Array:
         # @nnx.scan(in_axes=(0, nnx.Carry), out_axes=nnx.Carry)
@@ -432,9 +432,10 @@ class CuspElectrons(nnx.Module):
     """
     def __init__(self, num_electrons: int):
         electron_pairs = (num_electrons * (num_electrons - 1)) // 2
-        self.decay_strengths = None
         if electron_pairs > 0:
             self.decay_strengths = nnx.Param(jnp.ones((electron_pairs,)))
+        else:
+            self.decay_strengths = None
 
     def __call__(self, electron_distances: Array, spins: Array) -> Array:
         chex.assert_rank(spins, 2)
@@ -566,7 +567,10 @@ class WaveFunction(nnx.Module):
         # def create_slater_determinants(rng: Key) -> SlaterDeterminant:
         #     return SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rngs=rng)
         # self.slater_determinants = create_slater_determinants(rngs)
-        self.slater_determinants = [SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rngs=rngs) for _ in range(num_slaters)]
+        self.slater_determinants = nnx.List([
+            SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rngs=rngs)
+            for _ in range(num_slaters)
+        ])
 
         self.slater_strengths = nnx.Param(jnp.ones((num_slaters,), dtype=jnp.float32))
 
