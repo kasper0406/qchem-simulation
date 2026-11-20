@@ -434,9 +434,11 @@ class CuspElectrons(nnx.Module):
     """
     def __init__(self, num_electrons: int):
         electron_pairs = (num_electrons * (num_electrons - 1)) // 2
-        self.decay_strengths = None
+        self.decay_strength_parallel = None
+        self.decay_strength_antiparallel = None
         if electron_pairs > 0:
-            self.decay_strengths = nnx.Param(jnp.ones((electron_pairs,)))
+            self.decay_strength_parallel = nnx.Param(jnp.array(1.0))
+            self.decay_strength_antiparallel = nnx.Param(jnp.array(1.0))
 
     def __call__(self, electron_distances: Array, spins: Array) -> Array:
         chex.assert_rank(spins, 2)
@@ -444,7 +446,7 @@ class CuspElectrons(nnx.Module):
         chex.assert_axis_dimension(spins, 0, electron_distances.shape[0])
         chex.assert_shape(electron_distances, (spins.shape[0], spins.shape[0]))
 
-        if self.decay_strengths is None:
+        if self.decay_strength_parallel is None:
             return 0.0
 
         upper_indices = jnp.triu_indices(electron_distances.shape[0], k=1)
@@ -453,13 +455,17 @@ class CuspElectrons(nnx.Module):
 
         spins = jnp.squeeze(spins, axis=-1)
         spin_correlations = spins[:, None] == spins[None, :]
-        cusp_values = jnp.where(spin_correlations, 0.25, 0.5)
-        flat_cusp_values = jnp.reshape(cusp_values[upper_indices], (-1, ))
+        flat_spin_correlations = jnp.reshape(spin_correlations[upper_indices], (-1, ))
 
-        # log-Jastrow factor on the form: \sum_{i, j < i} (1/2) * d_{ij} / (1 + decay_strength_{ij} * d_{ij})
-        # where b is the decay strength
+        flat_cusp_values = jnp.where(flat_spin_correlations, 0.25, 0.5)
+        decay_parallel = jax.nn.softplus(self.decay_strength_parallel[...])
+        decay_antiparallel = jax.nn.softplus(self.decay_strength_antiparallel[...])
+        flat_decay_strengths = jnp.where(flat_spin_correlations, decay_parallel, decay_antiparallel)
+
+        # log-Jastrow factor on the form: \sum_{i < j} c_{ij} * d_{ij} / (1 + b_{ij} * d_{ij})
+        # where b_{ij} > 0 depends only on whether spins are parallel or anti-parallel.
         jastrow_factor = jnp.sum(
-            (flat_cusp_values * flat_pairwise_distances) / (1.0 + self.decay_strengths * flat_pairwise_distances),
+            (flat_cusp_values * flat_pairwise_distances) / (1.0 + flat_decay_strengths * flat_pairwise_distances),
             axis=(-1,),
         )
         return jastrow_factor
@@ -467,25 +473,50 @@ class CuspElectrons(nnx.Module):
 
 class CuspElectronNuclei(nnx.Module):
     """
-    Models the Kato cusp condition (https://en.wikipedia.org/wiki/Kato_theorem) for electrons.
+    Models the Kato cusp condition (https://en.wikipedia.org/wiki/Kato_theorem) for electron-nucleus pairs.
     """
     def __init__(self, num_electrons: int, num_nuclei: int):
         self.num_electrons = num_electrons
         self.num_nuclei = num_nuclei
 
-        self.decay_strengths = nnx.Param(jnp.ones((num_electrons, num_nuclei)))
+        self.decay_strengths = nnx.Param(jnp.ones((num_nuclei,)))
 
     def __call__(self, electron_nuclei_distances: Array, nuclei_charges: Array):
         chex.assert_shape(electron_nuclei_distances, (self.num_electrons, self.num_nuclei))
         chex.assert_shape(nuclei_charges, (self.num_nuclei,))
 
-        # log-Jastrow factor on the form: \sum_{i, j} -(nuclei_charges{i}) * d_{ij} / (1 + decay_strength_{ij} * d_{ij})
-        # where b is the decay strength
+        decay_strengths = jax.nn.softplus(self.decay_strengths[...])
+
+        # log-Jastrow factor on the form: \sum_{i, I} -Z_I * d_{iI} / (1 + b_I * d_{iI})
+        # where b_I > 0 is the nucleus-specific decay strength broadcast over all electrons.
         jastrow_factor = -jnp.sum(
-            (nuclei_charges[None, :] * electron_nuclei_distances) / (1.0 + self.decay_strengths * electron_nuclei_distances),
+            (nuclei_charges[None, :] * electron_nuclei_distances)
+            / (1.0 + decay_strengths[None, :] * electron_nuclei_distances),
             axis=(-1, -2),
         )
         return jastrow_factor
+
+
+class ExponentialEnvelope(nnx.Module):
+    """
+    Permutation-invariant learnable exponential decay envelope ensuring normalizability:
+    log_env(r) = sum_i log(sum_I pi_I * exp(-sigma_I * r_{iI}))
+    where pi_I > 0 and sigma_I > 0 are per-nucleus parameters broadcast over all electrons.
+    """
+    def __init__(self, num_nuclei: int):
+        self.num_nuclei = num_nuclei
+        self.pi = nnx.Param(jnp.ones((num_nuclei,)))
+        self.sigma = nnx.Param(jnp.ones((num_nuclei,)))
+
+    def __call__(self, electron_nuclei_distances: Array) -> Array:
+        chex.assert_rank(electron_nuclei_distances, 2)
+        chex.assert_axis_dimension(electron_nuclei_distances, 1, self.num_nuclei)
+
+        pi = jax.nn.softplus(self.pi[...]) + 1e-8
+        sigma = jax.nn.softplus(self.sigma[...])
+
+        log_terms = jnp.log(pi[None, :]) - sigma[None, :] * electron_nuclei_distances
+        return jnp.sum(jax.scipy.special.logsumexp(log_terms, axis=-1), axis=-1)
 
 
 class JastrowFactor(nnx.Module):
@@ -583,6 +614,7 @@ class WaveFunction(nnx.Module):
         )
 
         self.jastrow_factor = JastrowFactor(num_electrons=num_electrons, num_nuclei=num_nuclei, hdim=hidden_dim, rngs=rngs)
+        self.envelope = ExponentialEnvelope(num_nuclei=num_nuclei)
 
         num_slaters = num_nuclei
         # @nnx.split_rngs(splits=num_slaters)
@@ -616,7 +648,8 @@ class WaveFunction(nnx.Module):
         slater_logs, slater_signs, orthonormality_measures = calc_slater(self.slater_determinants, distances, electrons.spin, self.distance_encoders)
         slaters_sum, sign = slater_log_sum_exp(slater_logs, slater_signs, self.slater_strengths)
 
-        result = self.jastrow_factor(distances, nuclei.charge, electrons.spin, self.distance_encoders) + slaters_sum
+        envelope = self.envelope(distances.electron_nuclei_distances.magnitude)
+        result = self.jastrow_factor(distances, nuclei.charge, electrons.spin, self.distance_encoders) + slaters_sum + envelope
 
         return result.squeeze(), sign, jnp.mean(orthonormality_measures)  # Ensure we return a scalar
 
