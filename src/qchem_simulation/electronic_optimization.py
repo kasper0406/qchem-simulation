@@ -864,42 +864,48 @@ def optimize_wave_function_full(
     optimizer: nnx.Optimizer,
     samples: Electron,
     nuclei: Nucleus,
+    key: Key,
     *,
-    lambda_virial: float = 1e-3,
-key: Key) -> Array:
+    lambda_virial: float = 0.0,
+) -> Array:
+    """Perform a single VMC optimization step over all samples at once.
+
+    Computes the unbiased VMC energy gradient:
+        E[(E_L - <E_L>) * grad_theta log |psi|^2].
+
+    Note: ``lambda_virial`` defaults to 0.0 because a pointwise (2*T_L + V)^2
+    penalty is physically invalid (the virial theorem 2<T> + <V> = 0 holds only
+    for expectation values at equilibrium nuclear geometry, and the score-function
+    estimator omits the grad_theta T_L term).
+    """
     keys = jax.random.split(key, samples.position.shape[0])
 
     local_energies, log_grads, hamiltonian_details, log_psi = nnx.vmap(local_energy, in_axes=(None, 0, None, 0))(wave_function, samples, nuclei, keys)
-    # print(f"Log gradients: {log_grads}")
 
     avg_energy = jnp.mean(local_energies)
-    centered_energies = local_energies - avg_energy
-    # print(f"Energy offsets: {centered_energies}")
 
-    # The introduced penalty terms is to:
-    #  1. keep 2T+V=0 (virial theorem)
-    #  2. keep the orbitals orthonormal
     virial_penalty = jnp.square(2 * hamiltonian_details.kinetic_energy + hamiltonian_details.potential_energy)
-    penalty_terms = lambda_virial * virial_penalty # + lambda_ortho * orthonormality_measure
+    penalty_terms = lambda_virial * virial_penalty
+
+    loss_terms = local_energies + penalty_terms
+    centered_loss_terms = loss_terms - jnp.mean(loss_terms)
 
     loss_gradient = jax.tree.map(
-        lambda log_grads: jnp.expand_dims(centered_energies + penalty_terms, axis=tuple(range(1, log_grads.ndim))) * log_grads,
+        lambda log_grad: jnp.expand_dims(centered_loss_terms, axis=tuple(range(1, log_grad.ndim))) * log_grad,
         log_grads,
     )
-    # print(f"Loss gradient: {loss_gradient}")
 
     mean_loss_grads = jax.tree.map(
-        lambda loss_gradient: jnp.mean(loss_gradient, axis=0),
+        lambda lg: jnp.mean(lg, axis=0),
         loss_gradient,
     )
-    # print(f"Mean loss gradients: {mean_loss_grads}")
 
     optimizer.update(mean_loss_grads)
 
     mean_hamiltonian_details = jax.tree.map(lambda x: jnp.mean(x, axis=0), hamiltonian_details)
     return avg_energy, mean_hamiltonian_details, jnp.mean(log_psi)
 
-@nnx.jit
+@nnx.jit(static_argnames=["batch_size"])
 def optimize_wave_function_batched(
     wave_function: WaveFunction,
     optimizer: nnx.Optimizer,
@@ -908,8 +914,18 @@ def optimize_wave_function_batched(
     key: Key,
     *,
     batch_size: int = 100,
-    lambda_virial: float = 1e-3,
+    lambda_virial: float = 0.0,
 ) -> Array:
+    """Perform a single VMC optimization step by accumulating gradients over batches.
+
+    Computes the exact same VMC energy gradient as ``optimize_wave_function_full``:
+        E[(E_L - <E_L>) * grad_theta log |psi|^2].
+
+    Note: ``lambda_virial`` defaults to 0.0 because a pointwise (2*T_L + V)^2
+    penalty is physically invalid (the virial theorem 2<T> + <V> = 0 holds only
+    for expectation values at equilibrium nuclear geometry, and the score-function
+    estimator omits the grad_theta T_L term).
+    """
 
     @nnx.scan(
         in_axes=(None, nnx.Carry, 0, 0),
@@ -921,11 +937,8 @@ def optimize_wave_function_batched(
 
         local_energies, log_grads, hamiltonian_details, log_psi = nnx.vmap(local_energy, in_axes=(None, 0, None, 0))(wave_function, batch_samples, nuclei, keys)
 
-        # The introduced penalty terms is to:
-        #  1. keep 2T+V=0 (virial theorem)
-        #  2. keep the orbitals orthonormal
         virial_penalty = jnp.square(2 * hamiltonian_details.kinetic_energy + hamiltonian_details.potential_energy)
-        penalty_terms = lambda_virial * virial_penalty # + lambda_ortho * orthonormality_measure
+        penalty_terms = lambda_virial * virial_penalty
 
         loss_terms = local_energies + penalty_terms
 
@@ -968,8 +981,9 @@ def optimize_wave_function_batched(
     )
 
     # Compute the mean loss grads by using linearity of expectations:
-    #   E[((E_L - <E_L>) + penalty_terms) * log_grads] = E[E_L * log_grads] - <E_L> * E[log_grads]
-    # Then because we take the sum, we get the average by dividing by the number of samples
+    #   E[(L - <L>) * log_grads] = E[L * log_grads] - <L> * E[log_grads]
+    # where L = E_L + penalty_terms (with penalty_terms = 0 when lambda_virial = 0).
+    # Then because we take the sum, we get the average by dividing by the number of samples.
     avg_loss_term = loss_term_sum / num_samples
     mean_loss_grads = jax.tree.map(
         lambda w, g: (w / num_samples) - avg_loss_term * (g / num_samples),
