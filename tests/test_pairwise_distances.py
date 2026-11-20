@@ -6,8 +6,32 @@ from flax import nnx
 
 from qchem_simulation.electronic_optimization import (
     DistanceEncoder,
+    calculate_distances,
     calculate_pairwise_distances,
 )
+
+
+def test_electron_self_pair_features_preserve_relative_coordinate_gradients():
+    positions = jnp.array([[0.0, 0.0, 0.0], [1.0, 0.2, 0.1]], dtype=jnp.float32)
+    weights = jnp.array(
+        [[[1.0, 2.0, 1.0], [0.11, 0.22, 0.33]],
+         [[0.1, 0.5, 0.3], [3.0, 2.0, 1.0]]],
+        dtype=jnp.float32,
+    )
+
+    def pair_sum(r):
+        directions = calculate_distances(r, r[:1]).electron_distances.direction
+        return jnp.sum(weights * directions)
+
+    def independent_pair_sum(r):
+        delta = r[0] - r[1]
+        return jnp.dot(weights[0, 1] - weights[1, 0], delta / jnp.linalg.norm(delta))
+
+    # The diagonal directions are constant zero, even when their weights are large.
+    assert jnp.allclose(
+        jax.grad(pair_sum)(positions), jax.grad(independent_pair_sum)(positions),
+        rtol=1e-5, atol=1e-6,
+    )
 
 
 @pytest.mark.parametrize("scale", [1e-3, 1.0, 4.0, 100.0])

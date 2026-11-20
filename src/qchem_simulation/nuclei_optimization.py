@@ -6,6 +6,7 @@ from jaxtyping import Array, Key
 from flax import nnx
 from .hamiltonian import electron_nucleus_attraction, hamiltonian, nucleus_nucleus_repulsion
 from .sampling import sample_from_wavefunction
+from .swct_forces import swct_energy_grad as nuclei_energy_grad_swct
 from .utils import Nucleus, Electron, clip_by_global_norm
 from .wavefunction import WaveFunction
 import einops
