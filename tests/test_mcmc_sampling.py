@@ -82,6 +82,17 @@ def test_sample_from_wavefunction_acceptance_and_movement():
     assert float(jnp.mean(step_displacements)) > 1e-3
 
 
+def test_sampler_initializes_the_wavefunction_spin_sector():
+    wf = GaussianWaveFunction(jnp.zeros(3), 1.0)
+    wf.num_up = 0
+    nuclei = Nucleus(position=jnp.zeros((1, 3)), charge=jnp.array([2.0]))
+    samples, _, _ = sample_from_wavefunction(
+        wf, nuclei, 2, jax.random.key(0), num_chains=2, num_samples=2,
+        mcmc_burnin_steps=0, mcmc_thinning_factor=1,
+    )
+    assert jnp.all(samples.spin == -1)
+
+
 def test_per_electron_kernel_analytical_gaussian():
     """Verify per_electron_kernel samples accurately from a known 3D isotropic Gaussian."""
     mu = jnp.array([1.2, -0.7, 0.5], dtype=jnp.float32)

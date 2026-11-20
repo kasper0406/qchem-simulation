@@ -144,21 +144,28 @@ def calculate_kinetic_energy(
     )
 
 
-_COULOMB_EPS = 1e-12
+def _inverse_distance(displacement: Array) -> Array:
+    """Use 1/r away from contact; at contact use the finite 1e12 convention.
+
+    The exact collision has no defined Coulomb force. A constant branch gives
+    that single configuration a zero displacement gradient.
+    """
+    squared_distance = jnp.sum(jnp.square(displacement), axis=-1)
+    coincident = squared_distance == 0
+    safe_squared_distance = jnp.where(coincident, 1.0, squared_distance)
+    return jnp.where(coincident, 1e12, jax.lax.rsqrt(safe_squared_distance))
 
 
 def nucleus_nucleus_repulsion(nuclei: Nucleus) -> Array:
     nucleus_i, nucleus_j = jnp.triu_indices(nuclei.position.shape[0], k=1)
     charges = nuclei.charge[nucleus_i] * nuclei.charge[nucleus_j]
-    distances = jnp.linalg.norm(nuclei.position[nucleus_i] - nuclei.position[nucleus_j], axis=-1)
-    return jnp.sum(charges / (distances + _COULOMB_EPS))
+    displacement = nuclei.position[nucleus_i] - nuclei.position[nucleus_j]
+    return jnp.sum(charges * _inverse_distance(displacement))
 
 
 def electron_nucleus_attraction(electrons: Electron, nuclei: Nucleus) -> Array:
-    distances = jnp.linalg.norm(
-        electrons.position[:, None] - nuclei.position[None, :], axis=-1
-    )
-    return -jnp.sum(nuclei.charge[None, :] / (distances + _COULOMB_EPS))
+    displacement = electrons.position[:, None] - nuclei.position[None, :]
+    return -jnp.sum(nuclei.charge[None, :] * _inverse_distance(displacement))
 
 
 def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucleus, key: Key):
@@ -168,8 +175,8 @@ def hamiltonian(wave_function: "WaveFunction", electrons: Electron, nuclei: Nucl
     electron_repulsion = 0.0
     if electrons.position.shape[0] > 1:
         electron_i, electron_j = jnp.triu_indices(electrons.position.shape[0], k=1)
-        electron_distances = jnp.linalg.norm(electrons.position[electron_i] - electrons.position[electron_j], axis=-1)
-        electron_repulsion = jnp.sum(1.0 / (electron_distances + _COULOMB_EPS))
+        displacement = electrons.position[electron_i] - electrons.position[electron_j]
+        electron_repulsion = jnp.sum(_inverse_distance(displacement))
 
     nucleus_electron_interaction = electron_nucleus_attraction(electrons, nuclei)
 

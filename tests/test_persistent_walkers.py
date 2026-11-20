@@ -171,6 +171,7 @@ def test_persistent_walkers_sample_analytical_gaussian():
 def test_train_wavefunction_with_partial_batches(persistent):
     nuclei = Nucleus(position=jnp.zeros((1, 3)), charge=jnp.ones(1))
     wf = HydrogenTrialWaveFunction(alpha=1.2)
+    wf.num_up = 0
     optimizer = nnx.ModelAndOptimizer(wf, optax.sgd(0.01))
     key = jax.random.key(200)
     options = dict(init_step_size=0.03, target_acceptance=0.2, adapt_rate=0.3)
@@ -183,12 +184,13 @@ def test_train_wavefunction_with_partial_batches(persistent):
     assert not jnp.isclose(wf.alpha[...], 1.2)
     if persistent:
         init_key, warmup_key, _ = jax.random.split(key, 3)
-        initial = init_walkers(nuclei, 3, init_key, 1, options["init_step_size"])
+        initial = init_walkers(nuclei, 3, init_key, 1, options["init_step_size"], num_up=0)
         _, warmed, _, _ = step_walkers(
             HydrogenTrialWaveFunction(alpha=1.2), nuclei, initial, warmup_key,
             num_steps=2, mcmc_burnin_steps=2, target_acceptance=options["target_acceptance"],
             adapt_rate=options["adapt_rate"],
         )
+        assert jnp.all(result.spin == -1)
         assert result.position.shape == (3, 1, 3)
         assert jnp.isfinite(result.position).all()
         assert result.step_size == warmed.step_size
@@ -196,6 +198,7 @@ def test_train_wavefunction_with_partial_batches(persistent):
     else:
         assert result is None
         reference = HydrogenTrialWaveFunction(alpha=1.2)
+        reference.num_up = 0
         reference_opt = nnx.ModelAndOptimizer(reference, optax.sgd(0.01))
         _, loop_key = jax.random.split(key)
         for iteration_key in jax.random.split(loop_key, 2):

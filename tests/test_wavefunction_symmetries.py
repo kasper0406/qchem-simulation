@@ -11,6 +11,7 @@ from qchem_simulation.electronic_optimization import (
     WaveFunction,
     calculate_distances,
     calculate_kinetic_energy,
+    hamiltonian,
 )
 from qchem_simulation.utils import Electron, Nucleus
 
@@ -193,3 +194,51 @@ def test_wavefunction_kinetic_energy_and_grad_finite():
     grads = nnx.grad(loss_fn)(wf)
     grad_leaves = jax.tree_util.tree_leaves(grads)
     assert all(jnp.all(jnp.isfinite(g)) for g in grad_leaves)
+
+
+def test_neural_hydrogen_has_a_coulomb_cusp():
+    wf = WaveFunction(num_electrons=1, num_nuclei=1, rngs=nnx.Rngs(12))
+    nuclei = Nucleus(position=jnp.zeros((1, 3)), charge=jnp.ones(1))
+    spin = jnp.ones((1, 1))
+    directions = jnp.concatenate((jnp.eye(3), -jnp.eye(3)))
+    radius = 1e-4
+
+    @nnx.jit
+    @nnx.vmap(in_axes=(None, 0))
+    def evaluate(model, position):
+        electrons = Electron(position=position[None, :], spin=spin)
+        energy, _ = hamiltonian(model, electrons, nuclei, jax.random.key(0))
+        return model(electrons, nuclei)[0], energy
+
+    origin_log, _, _ = wf(Electron(position=jnp.zeros((1, 3)), spin=spin), nuclei)
+    nearby_logs, energies = evaluate(wf, radius * directions)
+    # Opposite directions cancel the linear terms from the smooth part of log|psi|.
+    spherical_slope = (jnp.mean(nearby_logs) - origin_log) / radius
+    chex.assert_trees_all_close(spherical_slope, -1.0, atol=0.05)
+    chex.assert_tree_all_finite(energies)
+    # A wrong cusp slope of order one leaves a local-energy pole of order 1/r.
+    assert jnp.max(jnp.abs(energies)) < 0.1 / radius
+
+
+@pytest.mark.parametrize("num_electrons,expected_energy", [(1, -0.5), (2, -0.25)])
+@jax.enable_x64()
+def test_local_energy_at_shrinking_cusp_radii(num_electrons, expected_energy):
+    class AnalyticCusp(nnx.Module):
+        def __call__(self, electrons, nuclei):
+            distances = calculate_distances(electrons.position, nuclei.position)
+            if num_electrons == 1:
+                log_psi = -distances.electron_nuclei_distances.magnitude[0, 0]
+            else:
+                # Opposite-spin pair with log ψ = r12 / 2 and no external potential.
+                log_psi = 0.5 * distances.electron_distances.magnitude[0, 1]
+            return log_psi, 1.0, 0.0
+
+    num_nuclei = 1 if num_electrons == 1 else 0
+    nuclei = Nucleus(position=jnp.zeros((num_nuclei, 3)), charge=jnp.ones(num_nuclei))
+    spins = jnp.array([[1.0], [-1.0]])[:num_electrons]
+    model = AnalyticCusp()
+    for radius in (1e-4, 1e-6, 1e-8):
+        positions = jnp.zeros((num_electrons, 3)).at[0, 0].set(radius)
+        electrons = Electron(position=positions, spin=spins)
+        energy, _ = hamiltonian(model, electrons, nuclei, jax.random.key(0))
+        assert jnp.isclose(energy, expected_energy, rtol=0, atol=1e-6)

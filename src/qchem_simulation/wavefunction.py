@@ -1,7 +1,7 @@
 """Neural Slater–Jastrow wavefunctions and their geometric features."""
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import chex
 from flax import nnx
@@ -17,6 +17,7 @@ from .utils import Electron, Nucleus
 class Distance:
     magnitude: Array  # Shape (n, n)
     direction: Array  # Unit vector shape (n, n, 3)
+    displacement: Array | None = None
 
 @jax.tree_util.register_dataclass
 @dataclass
@@ -97,24 +98,23 @@ class TransformerStack(nnx.Module):
 
 def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_half: bool = False) -> Distance:
     """
-    Calculate distance features between two sets of positions.
-    Returns the squared distances and the inverse distances.
+    Calculate pair distances and directions between two sets of positions.
 
     Rows will be from position_a, and columns will be from position_b.
     """
-    eps = 1e-12
     diff = position_a[:, None] - position_b[None, :]
     square_distances = jnp.sum(jnp.square(diff), axis=-1)
-    distances = jnp.sqrt(square_distances + eps)
-
-    unit_vectors = diff * jax.lax.rsqrt(square_distances[:, :, None] + eps)
+    separated = square_distances > 0
+    safe_distances = jnp.sqrt(jnp.where(separated, square_distances, 1.0))
+    distances = jnp.where(separated, safe_distances, 0.0)
+    unit_vectors = diff / safe_distances[..., None]
 
     if upper_half:
         # Keep only the upper half of the matrix (i.e., distances between different electrons)
         # print("Inside upper half calculation")
         upper_indices = jnp.triu_indices(distances.shape[0], k=1)
         distances = jnp.reshape(distances[upper_indices], (-1, ))
-        square_distances = jnp.reshape(square_distances[upper_indices], (-1, ))
+        diff = diff[upper_indices]
 
         # Notice the unit vectors will only keep one direction per pair of particles
         # when the upper half is selected
@@ -123,6 +123,7 @@ def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_hal
     return Distance(
         magnitude=distances,
         direction=unit_vectors,
+        displacement=diff,
     )
 
 
@@ -151,6 +152,9 @@ class StaticValue(nnx.Variable):
     pass
 
 
+_COALESCENCE_RADIUS = 0.1  # bohr
+
+
 class DistanceEncoder(nnx.Module):
     def __init__(self, hidden_dim: int, buckets: int, rngs: nnx.Rngs, cutoff: float = 10.0):
         self.centers = StaticValue(jnp.linspace(0.0, cutoff, buckets))
@@ -168,6 +172,12 @@ class DistanceEncoder(nnx.Module):
     def __call__(self, distance: Distance):
         chex.assert_shape(distance.magnitude, (None, None))
         chex.assert_shape(distance.direction, (None, None, 3))
+        displacement = distance.displacement
+        if displacement is None:
+            displacement = distance.direction * distance.magnitude[..., None]
+        radius_sq = jnp.sum(jnp.square(displacement), axis=-1)
+        smooth_radius = jnp.sqrt(radius_sq + _COALESCENCE_RADIUS**2)
+        bounded_displacement = displacement / smooth_radius[..., None]
 
         def _rbf_encoding(magnitudes: Array):
             """
@@ -178,9 +188,10 @@ class DistanceEncoder(nnx.Module):
             return jnp.exp(-0.5 * (diffs ** 2))
 
         @nnx.vmap
-        def _real_sh_L3(direction: Array):
-            chex.assert_shape(direction, (None, 3))  # Expecting a 3D unit vector
-            x, y, z = jnp.moveaxis(direction, -1, 0)
+        def _real_solid_harmonics_L3(displacement: Array):
+            chex.assert_shape(displacement, (None, 3))
+            x, y, z = jnp.moveaxis(displacement, -1, 0)
+            r2 = x*x + y*y + z*z
 
             # l = 1 (dipoles)
             c1 = 0.4886025119029199
@@ -191,16 +202,16 @@ class DistanceEncoder(nnx.Module):
             # l = 2 (quadrupoles)
             Y2m2 = 1.0925484305920792 * x * y
             Y2m1 = 1.0925484305920792 * y * z
-            Y20  = 0.31539156525252005 * (3.0 * z*z - 1.0)
+            Y20  = 0.31539156525252005 * (3.0 * z*z - r2)
             Y21  = 1.0925484305920792 * x * z
             Y22  = 0.5462742152960396 * (x*x - y*y)
 
             # l = 3 (octupoles) – fully-normalized real SH
             Y3m3 = 0.5900435899266435 * y * (3.0 * x*x - y*y)
             Y3m2 = 2.890611442640554 * x * y * z
-            Y3m1 = 0.4570457994644658 * y * (5.0 * z*z - 1.0)
-            Y30  = 0.3731763325901154 * z * (5.0 * z*z - 3.0)
-            Y31  = 0.4570457994644658 * x * (5.0 * z*z - 1.0)
+            Y3m1 = 0.4570457994644658 * y * (5.0 * z*z - r2)
+            Y30  = 0.3731763325901154 * z * (5.0 * z*z - 3.0 * r2)
+            Y31  = 0.4570457994644658 * x * (5.0 * z*z - r2)
             Y32  = 1.445305721320277 * z * (x*x - y*y)
             Y33  = 0.5900435899266435 * x * (x*x - 3.0 * y*y)
 
@@ -214,8 +225,9 @@ class DistanceEncoder(nnx.Module):
 
             return stacked
 
-        radial_features = self.rbf_proj(_rbf_encoding(distance.magnitude))
-        direction_features = self.direction_proj(_real_sh_L3(distance.direction))
+        radial_features = self.rbf_proj(_rbf_encoding(smooth_radius))
+        # Solid harmonics are smooth at zero and approach spherical harmonics at long range.
+        direction_features = self.direction_proj(_real_solid_harmonics_L3(bounded_displacement))
         combined_features = jnp.concat([radial_features, direction_features], axis=-1)
 
         up_projected = self.feature_up_proj(combined_features)
@@ -302,46 +314,119 @@ class OrbitalHead(nnx.Module):
         return self.dense(x)
 
 
-# The following constructs a wave function using a neural network, following the
-# terminology described by https://en.wikipedia.org/wiki/Slater_determinant#Multi-particle_case
-# Split the Slater determinant into one for each spin, as interchanging electrons of opposite spin
-# will not cause any anti-symmetry
+def spin_up_count(num_electrons: int, num_up: Optional[int]) -> int:
+    """Resolve the fixed spin population shared by the model and sampler."""
+    if num_up is None:
+        return (num_electrons + 1) // 2
+    if not (0 <= num_up <= num_electrons):
+        raise ValueError(f"num_up ({num_up}) must be between 0 and num_electrons ({num_electrons}).")
+    return num_up
+
+
 class OrbitalNetwork(nnx.Module):
-    def __init__(self, hdim: int, num_electrons: int, num_nuclei: int, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        hdim: int,
+        num_electrons: int,
+        num_nuclei: int,
+        rngs: nnx.Rngs,
+        num_up: Optional[int] = None,
+    ):
+        num_up = spin_up_count(num_electrons, num_up)
+
+        self.num_electrons = num_electrons
+        self.num_up = num_up
+        self.num_down = num_electrons - num_up
+
         self.spin_encoder = nnx.Embed(2, features=hdim, rngs=rngs)
         self.electronic_attention = ElectronicAttention(hdim, num_electrons, num_nuclei, rngs=rngs)
 
-        self.up_head = OrbitalHead(hdim, num_electrons, rngs=rngs)
-        self.down_head = OrbitalHead(hdim, num_electrons, rngs=rngs)
+        self.up_head = OrbitalHead(hdim, self.num_up, rngs=rngs) if self.num_up > 0 else None
+        self.down_head = OrbitalHead(hdim, self.num_down, rngs=rngs) if self.num_down > 0 else None
 
-    def __call__(self, distances: Distances, spins: Array, distance_encoders: DistanceEncoders) -> Array:
-        chex.assert_shape(spins, (None, 1))  # Expecting spins to be a column vector
+    def __call__(
+        self, distances: Distances, spins: Array, distance_encoders: DistanceEncoders
+    ) -> tuple[tuple[Optional[Array], Optional[Array]], Array]:
+        chex.assert_shape(spins, (self.num_electrons, 1))  # Expecting spins to be a column vector
 
         spin_classes = jnp.where(spins > 0, 1, 0)
-        # print("Spin classes:", spin_classes)
         spin_embedding = jnp.squeeze(self.spin_encoder(spin_classes), axis=-2)
 
-        attention = self.electronic_attention(distances, distance_encoders=distance_encoders, extra_features=spin_embedding)
-        print(f"Attention shape: {attention.shape}")
+        attention = self.electronic_attention(
+            distances, distance_encoders=distance_encoders, extra_features=spin_embedding
+        )
 
-        # Ensure we create proper nodes in the orbital matrix for different spins
-        orbital_matrix = jnp.where(spins > 0, self.up_head(attention), self.down_head(attention))
+        is_up = spins[:, 0] > 0
+        orthonormality_measure = jnp.zeros((), dtype=attention.dtype)
 
-        orthonormality_measure = jnp.sum((orbital_matrix.T @ orbital_matrix - jnp.eye(orbital_matrix.shape[0])) ** 2, axis=(-1, -2))
+        up_orbitals: Optional[Array] = None
+        if self.num_up > 0:
+            up_indices = jnp.nonzero(is_up, size=self.num_up)[0]
+            up_orbitals = self.up_head(attention[up_indices])
+            up_gram = up_orbitals.T @ up_orbitals - jnp.eye(self.num_up, dtype=up_orbitals.dtype)
+            orthonormality_measure = orthonormality_measure + jnp.sum(up_gram ** 2, axis=(-1, -2))
 
-        return orbital_matrix, orthonormality_measure
+        down_orbitals: Optional[Array] = None
+        if self.num_down > 0:
+            down_indices = jnp.nonzero(~is_up, size=self.num_down)[0]
+            down_orbitals = self.down_head(attention[down_indices])
+            down_gram = down_orbitals.T @ down_orbitals - jnp.eye(self.num_down, dtype=down_orbitals.dtype)
+            orthonormality_measure = orthonormality_measure + jnp.sum(down_gram ** 2, axis=(-1, -2))
+
+        return (up_orbitals, down_orbitals), orthonormality_measure
 
 
 class SlaterDeterminant(nnx.Module):
-    def __init__(self, num_electrons: int, num_nuclei: int, hidden_dim: int, rngs: nnx.Rngs):
-        self.orbital_network = OrbitalNetwork(hidden_dim, num_electrons, num_nuclei, rngs=rngs)
+    def __init__(
+        self,
+        num_electrons: int,
+        num_nuclei: int,
+        hidden_dim: int,
+        rngs: nnx.Rngs,
+        num_up: Optional[int] = None,
+    ):
+        self.orbital_network = OrbitalNetwork(
+            hidden_dim, num_electrons, num_nuclei, rngs=rngs, num_up=num_up
+        )
 
-    def __call__(self, distances: Array, spins: Array, distance_encoders: DistanceEncoders) -> Array:
-        orbitals, orthonormality_measure = self.orbital_network(distances, spins, distance_encoders=distance_encoders)
-        print(f"Orbital matrix shape: {orbitals.shape}")
-        log_det = jnp.linalg.slogdet(orbitals, method="qr")  # log determinant
-        print(f"Log-Determinant value: {log_det}")
-        return log_det.logabsdet, log_det.sign, orthonormality_measure
+    def __call__(
+        self, distances: Distances, spins: Array, distance_encoders: DistanceEncoders
+    ) -> tuple[Array, Array, Array]:
+        (up_orbitals, down_orbitals), orthonormality_measure = self.orbital_network(
+            distances, spins, distance_encoders=distance_encoders
+        )
+
+        if up_orbitals is not None:
+            dtype = up_orbitals.dtype
+        elif down_orbitals is not None:
+            dtype = down_orbitals.dtype
+        else:
+            dtype = jnp.float32
+
+        total_logabsdet = jnp.zeros((), dtype=dtype)
+        # Regrouping labeled electrons into up and down blocks permutes rows.
+        # Each down electron preceding an up electron contributes one inversion.
+        is_up = spins[:, 0] > 0
+        inversions = jnp.sum(jnp.where(is_up, jnp.cumsum(~is_up), 0))
+        total_sign = jnp.where(inversions % 2 == 0, 1, -1).astype(dtype)
+
+        if up_orbitals is not None:
+            up_det = jnp.linalg.slogdet(up_orbitals, method="qr")
+            total_logabsdet = total_logabsdet + up_det.logabsdet
+            total_sign = total_sign * up_det.sign
+
+        if down_orbitals is not None:
+            down_det = jnp.linalg.slogdet(down_orbitals, method="qr")
+            total_logabsdet = total_logabsdet + down_det.logabsdet
+            total_sign = total_sign * down_det.sign
+
+        # A fixed-sector state has zero amplitude for every other spin population.
+        in_sector = jnp.sum(is_up) == self.orbital_network.num_up
+        return (
+            jnp.where(in_sector, total_logabsdet, -jnp.inf),
+            jnp.where(in_sector, total_sign, 0),
+            orthonormality_measure,
+        )
 
 
 class CuspElectrons(nnx.Module):
@@ -417,8 +502,9 @@ class CuspElectronNuclei(nnx.Module):
 class ExponentialEnvelope(nnx.Module):
     """
     Permutation-invariant learnable exponential decay envelope ensuring normalizability:
-    log_env(r) = sum_i log(sum_I pi_I * exp(-sigma_I * r_{iI}))
+    log_env(r) = sum_i log(sum_I pi_I * exp(-sigma_I * sqrt(r_{iI}^2 + a^2)))
     where pi_I > 0 and sigma_I > 0 are per-nucleus parameters broadcast over all electrons.
+    The softened radius has zero radial slope at each center, leaving the cusp to the Jastrow factor.
     """
     def __init__(self, num_nuclei: int):
         self.num_nuclei = num_nuclei
@@ -430,9 +516,10 @@ class ExponentialEnvelope(nnx.Module):
         chex.assert_axis_dimension(electron_nuclei_distances, 1, self.num_nuclei)
 
         pi = jax.nn.softplus(self.pi[...]) + 1e-8
-        sigma = jax.nn.softplus(self.sigma[...])
+        sigma = jax.nn.softplus(self.sigma[...]) + 1e-8
 
-        log_terms = jnp.log(pi[None, :]) - sigma[None, :] * electron_nuclei_distances
+        smooth_radius = jnp.sqrt(jnp.square(electron_nuclei_distances) + _COALESCENCE_RADIUS**2)
+        log_terms = jnp.log(pi[None, :]) - sigma[None, :] * smooth_radius
         return jnp.sum(jax.scipy.special.logsumexp(log_terms, axis=-1), axis=-1)
 
 
@@ -519,9 +606,19 @@ def slater_log_sum_exp(slater_logs, slater_signs, slater_coeffs):
 
 
 class WaveFunction(nnx.Module):
-    def __init__(self, num_electrons: int, num_nuclei: int, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        num_electrons: int,
+        num_nuclei: int,
+        rngs: nnx.Rngs,
+        num_up: Optional[int] = None,
+    ):
+        num_up = spin_up_count(num_electrons, num_up)
+
         self.num_electrons = num_electrons
         self.num_nuclei = num_nuclei
+        self.num_up = num_up
+        self.num_down = num_electrons - num_up
 
         hidden_dim = 64
         self.distance_encoders = DistanceEncoders(
@@ -540,7 +637,7 @@ class WaveFunction(nnx.Module):
         #     return SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rngs=rng)
         # self.slater_determinants = create_slater_determinants(rngs)
         self.slater_determinants = nnx.List([
-            SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rngs=rngs)
+            SlaterDeterminant(num_electrons, num_nuclei, hidden_dim, rngs=rngs, num_up=self.num_up)
             for _ in range(num_slaters)
         ])
 
@@ -571,7 +668,10 @@ class WaveFunction(nnx.Module):
         envelope = self.envelope(distances.electron_nuclei_distances.magnitude)
         result = self.jastrow_factor(distances, nuclei.charge, electrons.spin, self.distance_encoders) + slaters_sum + envelope
 
-        return result.squeeze(), sign, jnp.mean(orthonormality_measures)  # Ensure we return a scalar
+        # The signed-log reducer regularizes spatial nodes; an excluded spin
+        # sector is exactly zero independent of the electron positions.
+        in_sector = jnp.sum(electrons.spin > 0) == self.num_up
+        return jnp.where(in_sector, result.squeeze(), -jnp.inf), sign, jnp.mean(orthonormality_measures)
 
     def eval_wrt_electron_position(self, position: Array, nuclei: Nucleus, position_index: int, all_positions: Array, spins: Array) -> Array:
         """

@@ -362,6 +362,7 @@ def train_wavefunction(
             rng=init_key,
             sum_of_charges=sum_of_charges,
             init_step_size=init_step_size,
+            num_up=getattr(wave_function, "num_up", None),
         )
         if initial_burnin_steps > 0:
             _, walker_state, _, _ = step_walkers(

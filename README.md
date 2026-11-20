@@ -9,3 +9,4 @@ Neural variational Monte Carlo (VMC) playground for small quantum chemistry syst
 - `sampling.py` contains electron initialization, MALA transitions, and sample collection.
 - `electronic_optimization.py` combines samples and local energies into electronic VMC updates and re-exports the existing electronic API.
 - `nuclei_optimization.py` estimates nuclear gradients and advances the geometry.
+- `excited_states.py` is an opt-in NES-VMC prototype for real-valued states. The tests demonstrate harmonic-oscillator training and analytic hydrogen energies. Use a smooth signed-amplitude evaluator for configurations where an individual state has a node.
