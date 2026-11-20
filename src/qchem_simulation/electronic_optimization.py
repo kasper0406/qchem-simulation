@@ -191,7 +191,7 @@ def calculate_pairwise_distances(position_a: Array, position_b: Array, upper_hal
     square_distances = jnp.sum(jnp.square(diff), axis=-1)
     distances = jnp.sqrt(square_distances + eps)
 
-    unit_vectors = diff * jax.lax.rsqrt(distances[:, :, None] + eps)
+    unit_vectors = diff * jax.lax.rsqrt(square_distances[:, :, None] + eps)
 
     if upper_half:
         # Keep only the upper half of the matrix (i.e., distances between different electrons)
