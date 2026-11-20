@@ -5,7 +5,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import jax.scipy.special as jsp
-import pytest
 from flax import nnx
 
 from qchem_simulation.electronic_optimization import WaveFunction
@@ -217,7 +216,7 @@ def test_warp_log_jacobian_grad_matches_finite_differences():
 # ---------------------------------------------------------------------------
 
 
-def test_swct_unbiased_against_exact_finite_differences():
+def test_swct_mean_agrees_with_exact_finite_differences():
     alpha = 0.8
     charges = jnp.array([1.0, 1.0])
     # Asymmetric bond axis to test non-zero gradients across all 3 Cartesian axes
@@ -251,7 +250,7 @@ def test_swct_unbiased_against_exact_finite_differences():
     # Standard error of the Monte Carlo mean
     stderr = jnp.std(per_sample, axis=0) / jnp.sqrt(num_samples)
 
-    # Check statistical unbiasedness: within 3.5 standard errors and close in absolute terms
+    # Compare this sampled estimate to the exact derivative within Monte Carlo error.
     z_scores = jnp.abs(grad_swct - grad_exact_fd) / (stderr + 1e-12)
     assert jnp.all(z_scores < 3.5), (
         f"SWCT grad {grad_swct} deviates from exact FD {grad_exact_fd} "

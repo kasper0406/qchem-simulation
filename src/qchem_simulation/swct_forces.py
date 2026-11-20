@@ -1,6 +1,6 @@
 """Space-Warp Coordinate Transformation (SWCT) nuclear force estimator.
 
-Implements the exact, finite-variance SWCT nuclear energy gradient estimator
+Implements the SWCT nuclear energy gradient estimator
 (Umrigar 1989; Filippi & Umrigar 2000; Sorella & Capriotti 2010) for neural
 Variational Monte Carlo (VMC).
 
@@ -20,13 +20,19 @@ Defining the warped log-weight:
     log J(R) = sum_i log|det(d r_tilde_i(R) / d r_i)|,
 
 and warped local energy ``E_L_tilde(R) = E_L(r_tilde(R); R)``, differentiating
-``<E(R)>`` at ``R = R_0`` yields the exact, unbiased SWCT energy gradient:
+``<E(R)>`` at ``R = R_0`` gives the population energy gradient:
 
     grad_R <E> = E[grad_R E_L_tilde] + E[(E_L_tilde - <E_L>) * grad_R log W].
 
-Because ``w_I(r_i) -> 1`` as ``r_i -> R_{0,I}``, ``r_tilde_i(R) - R_I`` becomes
-constant with respect to ``R_I`` near nucleus ``I``, cancelling the ``1 / r^2``
-Hellmann-Feynman singularity and yielding a finite-variance estimator.
+Near an isolated nucleus, the corresponding warp weight approaches one to
+within the accuracy set by eps. Moving the electron with the nucleus reduces
+the singular Coulomb-force contribution. Moving wavefunction nodes can still
+give the force estimator infinite variance.
+
+The sample implementations use the same walkers for the energy mean and the
+score covariance. For N independent walkers the covariance term therefore has
+expectation (N - 1) / N times the population covariance. Correlated walkers
+introduce additional lag-dependent terms.
 """
 
 from __future__ import annotations
@@ -38,7 +44,8 @@ import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Key
 
-from .electronic_optimization import WaveFunction, hamiltonian
+from .hamiltonian import hamiltonian
+from .wavefunction import WaveFunction
 from .utils import Electron, Nucleus
 
 
@@ -282,7 +289,7 @@ def swct_energy_grad(
     power: float = 4.0,
     batch_size: int | None = None,
 ) -> Array:
-    """Compute the unbiased SWCT nuclear energy gradient for a neural ``WaveFunction``.
+    """Estimate the SWCT nuclear energy gradient for a neural ``WaveFunction``.
 
     Compatible with ``nnx.jit`` and matches the positional signature of
     ``nuclei_energy_grad_full`` and ``nuclei_energy_grad_hellmann_feynman``.
