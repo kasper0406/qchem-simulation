@@ -1,6 +1,7 @@
 import chex
 import jax
 import jax.numpy as jnp
+import pytest
 import optax
 from flax import nnx
 
@@ -52,7 +53,8 @@ def _hydrogen_nucleus() -> Nucleus:
     )
 
 
-def test_full_and_batched_match_default_hydrogen():
+@pytest.mark.parametrize("batch_size", [10, 13, 100])
+def test_full_and_batched_match_default_hydrogen(batch_size):
     """optimize_wave_function_full and optimize_wave_function_batched must produce
     identical average energy, hamiltonian details, log_psi, and parameter updates."""
     nuclei = _hydrogen_nucleus()
@@ -68,7 +70,7 @@ def test_full_and_batched_match_default_hydrogen():
         wf_full, opt_full, samples, nuclei, step_key
     )
     e_batched, h_batched, lp_batched = optimize_wave_function_batched(
-        wf_batched, opt_batched, samples, nuclei, step_key, batch_size=10
+        wf_batched, opt_batched, samples, nuclei, step_key, batch_size=batch_size
     )
 
     chex.assert_trees_all_close(e_full, e_batched, rtol=1e-5, atol=1e-5)

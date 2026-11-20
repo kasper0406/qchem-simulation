@@ -196,7 +196,7 @@ def step_walkers(
     """Advance persistent MCMC walkers by `num_steps` sweeps with optional adaptive step size.
 
     Each sweep updates every electron once in a random permutation order per chain using MALA.
-    When `adapt_rate > 0`, the step size is updated after each sweep toward `target_acceptance`.
+    Only the first `mcmc_burnin_steps` discarded sweeps may adapt the step size.
 
     Returns:
         samples: Electron with position shape (num_kept_steps, num_chains, num_electrons, 3)
@@ -249,12 +249,13 @@ def step_walkers(
         )
         return new_electron_positions, log_density[-1], jnp.mean(acceptance_rate)
 
-    @nnx.scan(in_axes=(None, 0, nnx.Carry, 0), out_axes=(0, nnx.Carry, 0, 0), length=num_steps)
+    @nnx.scan(in_axes=(None, 0, nnx.Carry, 0, 0), out_axes=(0, nnx.Carry, 0, 0), length=num_steps)
     def scan_num_steps(
         wave_function: WaveFunction,
         electron_indices: Array, # Shape (num_steps, num_chains, num_electrons)
         carry: tuple[Array, Array], # (electron_positions, step_size)
         step_rng: Key,
+        sweep_index: Array,
     ):
         electron_positions, current_step_size = carry
         chex.assert_shape(electron_indices, (num_chains, num_electrons))
@@ -273,7 +274,7 @@ def step_walkers(
             current_step_size,
             step_acceptance,
             target_acceptance=target_acceptance,
-            adapt_rate=adapt_rate,
+            adapt_rate=jnp.where(sweep_index < mcmc_burnin_steps, adapt_rate, 0.0),
             min_step_size=min_step_size,
             max_step_size=max_step_size,
         )
@@ -296,6 +297,7 @@ def step_walkers(
         electron_permutations,
         (walker_state.position, init_step_size),
         step_keys,
+        jnp.arange(num_steps),
     )
     chex.assert_shape(electron_position_samples, (num_steps, num_chains, num_electrons, 3))
 
@@ -324,7 +326,7 @@ def sample_from_wavefunction(
     mcmc_thinning_factor: int = 2,
     init_step_size: float = 0.1,
     target_acceptance: float = 0.5,
-    adapt_rate: float = 0.05,
+    adapt_rate: float = 0.0,
 ):
     init_electrons_key, sample_key = jax.random.split(key, 2)
 

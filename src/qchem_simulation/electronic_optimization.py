@@ -2,7 +2,6 @@
 
 from typing import Optional
 
-import chex
 import einops
 from flax import nnx
 import jax
@@ -162,15 +161,31 @@ def optimize_wave_function_batched(
     estimator omits the grad_theta T_L term).
     """
 
+    num_samples = samples.position.shape[0]
+    if num_samples == 0 or batch_size <= 0:
+        raise ValueError("VMC updates require samples and a positive batch size")
+    batch_size = min(batch_size, num_samples)
+    padding = (-num_samples) % batch_size
+    num_batches = (num_samples + padding) // batch_size
+
     @nnx.scan(
-        in_axes=(None, nnx.Carry, 0, 0),
+        in_axes=(None, nnx.Carry, 0, 0, 0),
         out_axes=nnx.Carry,
     )
-    def process_batch(wave_function: WaveFunction, carry, batch_samples: Electron, batch_key):
+    def process_batch(wave_function: WaveFunction, carry, batch_samples: Electron, batch_key, valid):
         weighed_grads_sum, local_energy_sum, loss_term_sum, grads_sum, hamiltonian_details_sum, log_psi_sum = carry
         keys = jax.random.split(batch_key, batch_samples.position.shape[0])
 
         local_energies, log_grads, hamiltonian_details, log_psi = nnx.vmap(local_energy, in_axes=(None, 0, None, 0))(wave_function, batch_samples, nuclei, keys)
+
+        if padding:
+            def exclude_padding(x):
+                shape = (batch_size,) + (1,) * (x.ndim - 1)
+                return jnp.where(valid.reshape(shape), x, 0)
+
+            local_energies, log_grads, hamiltonian_details, log_psi = jax.tree.map(
+                exclude_padding, (local_energies, log_grads, hamiltonian_details, log_psi)
+            )
 
         virial_penalty = jnp.square(2 * hamiltonian_details.kinetic_energy + hamiltonian_details.potential_energy)
         penalty_terms = lambda_virial * virial_penalty
@@ -203,16 +218,16 @@ def optimize_wave_function_batched(
     init_weighed_grads = jax.tree.map(jnp.zeros_like, grads_shape)
     init_hamiltonian_details = jax.tree.map(jnp.zeros_like, hamiltonian_details_shape)
 
-    # Re-arrange the input samples
-    num_samples = samples.position.shape[0]
-    chex.assert_is_divisible(num_samples, batch_size)
-    num_batches = num_samples // batch_size
+    # Duplicate a valid configuration for static batch shapes and exclude it from every sum.
+    if padding:
+        samples = jax.tree.map(lambda x: jnp.concatenate((x, jnp.repeat(x[-1:], padding, axis=0))), samples)
     batch_samples = jax.tree.map(lambda x: einops.rearrange(x, "(b n) ... -> b n ...", b=num_batches), samples)
+    valid = (jnp.arange(num_samples + padding) < num_samples).reshape(num_batches, batch_size)
 
     # Compute the batches sequentially
     batch_keys = jax.random.split(key, num_batches)
     weighed_grads_sum, local_energy_sum, loss_term_sum, grads_sum, hamiltonian_details_sum, log_psi_sum = process_batch(
-        wave_function, (init_weighed_grads, 0.0, 0.0, init_grads, init_hamiltonian_details, 0.0), batch_samples, batch_keys
+        wave_function, (init_weighed_grads, 0.0, 0.0, init_grads, init_hamiltonian_details, 0.0), batch_samples, batch_keys, valid
     )
 
     # Compute the mean loss grads by using linearity of expectations:
@@ -247,6 +262,9 @@ def sample_and_optimize_wave_function(
     mcmc_burnin_steps: int = 50,
     mcmc_thinning_factor: int = 2,
     batch_size: int = 100,
+    init_step_size: float = 0.1,
+    target_acceptance: float = 0.5,
+    adapt_rate: float = 0.0,
 ):
     chain_key, hamiltonian_key = jax.random.split(key, 2)
     samples, log_densities, acceptance_rate = sample_from_wavefunction(
@@ -256,6 +274,9 @@ def sample_and_optimize_wave_function(
         key=chain_key,
         num_chains=num_chains,
         num_samples=num_samples,
+        init_step_size=init_step_size,
+        target_acceptance=target_acceptance,
+        adapt_rate=adapt_rate,
         mcmc_burnin_steps=mcmc_burnin_steps,
         mcmc_thinning_factor=mcmc_thinning_factor,
     )
@@ -277,8 +298,6 @@ def step_and_optimize_wave_function(
     nuclei: Nucleus,
     num_mcmc_steps: int,
     mcmc_thinning_factor: int,
-    target_acceptance: float,
-    adapt_rate: float,
     batch_size: int,
     walker_state: WalkerState,
     key: Key,
@@ -291,8 +310,6 @@ def step_and_optimize_wave_function(
         walker_state=walker_state,
         key=chain_key,
         num_steps=num_mcmc_steps,
-        target_acceptance=target_acceptance,
-        adapt_rate=adapt_rate,
         mcmc_burnin_steps=0,
         mcmc_thinning_factor=mcmc_thinning_factor,
     )
@@ -318,20 +335,22 @@ def train_wavefunction(
     num_chains: int,
     key: Key,
     *,
-    persistent_walkers: bool = True,
+    persistent_walkers: bool = False,
     initial_burnin_steps: int = 50,
-    mcmc_thinning_factor: int = 1,
+    mcmc_thinning_factor: int = 2,
     init_step_size: float = 0.1,
     target_acceptance: float = 0.5,
-    adapt_rate: float = 0.05,
+    adapt_rate: float = 0.0,
     batch_size: int = 100,
 ) -> Optional[WalkerState]:
     """
     Optimize the wave function by sampling and updating the parameters.
 
-    When `persistent_walkers=True` (default), walkers are initialized once, burned in
-    for `initial_burnin_steps`, and then persisted across optimization steps with
-    adaptive MALA step-size control (avoiding per-step re-initialization and burn-in).
+    Cold-start training runs `num_samples` sweeps per update, including burn-in.
+    With `persistent_walkers=True`, one initial burn-in precedes training, and
+    each update runs `num_samples` production sweeps from the previous positions.
+    Both modes thin production sweeps by `mcmc_thinning_factor`. A positive
+    `adapt_rate` tunes the MALA step size during discarded burn-in sweeps.
     """
     sum_of_charges = int(jnp.sum(nuclei.charge))
 
@@ -353,7 +372,7 @@ def train_wavefunction(
                 num_steps=int(initial_burnin_steps),
                 target_acceptance=target_acceptance,
                 adapt_rate=adapt_rate,
-                mcmc_burnin_steps=0,
+                mcmc_burnin_steps=int(initial_burnin_steps),
                 mcmc_thinning_factor=1,
             )
 
@@ -364,8 +383,6 @@ def train_wavefunction(
             nuclei,
             int(num_samples),
             int(mcmc_thinning_factor),
-            target_acceptance,
-            adapt_rate,
             int(batch_size),
         )
 
@@ -408,6 +425,9 @@ def train_wavefunction(
             mcmc_burnin_steps=int(initial_burnin_steps),
             mcmc_thinning_factor=int(mcmc_thinning_factor),
             batch_size=int(batch_size),
+            init_step_size=init_step_size,
+            target_acceptance=target_acceptance,
+            adapt_rate=adapt_rate,
         )
 
         print(f"Average energy step {step}: {avg_energy}")
