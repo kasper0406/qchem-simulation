@@ -1,3 +1,4 @@
+import chex
 import jax
 import jax.numpy as jnp
 import optax
@@ -25,6 +26,9 @@ def nuclei_energy_grad_full(
     where the second term is the Pulay / score-function contribution arising from
     the R-dependence of the sampling distribution |psi(x; R)|^2.
     """
+    chex.assert_shape(electron_samples.position, (None, None, 3))
+    chex.assert_shape(nuclei.position, (None, 3))
+
     def hamiltonian_energy(
         nuclei_positions: Array,
         wf: WaveFunction,
@@ -32,6 +36,8 @@ def nuclei_energy_grad_full(
         nuclei_charges: Array,
         sample_key: Key,
     ) -> Array:
+        chex.assert_shape(electron_sample.position, (None, 3))
+        chex.assert_shape(nuclei_positions, (None, 3))
         nuclei_obj = Nucleus(position=nuclei_positions, charge=nuclei_charges)
         energy, _details = hamiltonian(wf, electron_sample, nuclei_obj, sample_key)
         return energy
@@ -139,6 +145,29 @@ def nuclei_energy_grad_full(
     return mean_energy_grad + pulay_grad
 
 
+def simplified_hamiltonian(electrons: Electron, nuclei: Nucleus):
+    """
+    For a given state |psi> computes the classical Coulomb potential energy
+    (electron-nucleus attraction + nucleus-nucleus repulsion).
+    """
+    chex.assert_shape(electrons.position, (None, 3))
+    chex.assert_shape(nuclei.position, (None, 3))
+
+    eps = 1e-12
+
+    nuclea_i, nuclea_j = jnp.triu_indices(nuclei.position.shape[0], k=1)
+    nuclei_charge = nuclei.charge[nuclea_i] * nuclei.charge[nuclea_j]
+    nuclei_distances = jnp.linalg.norm(nuclei.position[nuclea_i] - nuclei.position[nuclea_j], axis=-1)
+    nuclea_interaction = jnp.sum(nuclei_charge / (nuclei_distances + eps))
+
+    electron_nuclei_distances = jnp.linalg.norm(
+        electrons.position[:, None] - nuclei.position[None, :], axis=-1
+    )
+    nucleus_electron_interaction = -jnp.sum(nuclei.charge[None, :] / (electron_nuclei_distances + eps))
+
+    return nucleus_electron_interaction + nuclea_interaction
+
+
 def nuclei_energy_grad_hellmann_feynman(
     _wave_function: WaveFunction,
     electron_samples: Electron,
@@ -156,29 +185,16 @@ def nuclei_energy_grad_hellmann_feynman(
     Notice, the wave_function itself is not used directly, but it is implicitly used to generate the electron_samples.
     It (along with the key) is kept in the function signature to be consistent with nuclei_energy_grad_full.
     """
-    def simplified_hamiltonian(electrons: Electron, nuclei: Nucleus):
-        """
-        For a given state |psi> computes: H|psi> / psi (the local energy).
-        """
-        eps = 1e-12
-
-        nuclea_i, nuclea_j = jnp.triu_indices(nuclei.position.shape[0], k=1)
-        nuclei_charge = nuclei.charge[nuclea_i] * nuclei.charge[nuclea_j]
-        nuclei_distances = jnp.linalg.norm(nuclei.position[nuclea_i] - nuclei.position[nuclea_j], axis=-1)
-        nuclea_interaction = jnp.sum(nuclei_charge / (nuclei_distances + eps))
-
-        electron_nuclei_distances = jnp.linalg.norm(
-            electrons.position[:, None] - nuclei.position[None, :], axis=-1
-        )
-        nucleus_electron_interaction = -jnp.sum(nuclei.charge[None, :] / (electron_nuclei_distances + eps))
-
-        return nucleus_electron_interaction + nuclea_interaction
+    chex.assert_shape(electron_samples.position, (None, None, 3))
+    chex.assert_shape(nuclei.position, (None, 3))
 
     def hamiltonian_energy(
         nuclei_positions: Array,
         electron_sample: Electron,
         nuclei_charges: Array,
     ):
+        chex.assert_shape(electron_sample.position, (None, 3))
+        chex.assert_shape(nuclei_positions, (None, 3))
         nuclei_obj = Nucleus(position=nuclei_positions, charge=nuclei_charges)
         return simplified_hamiltonian(electron_sample, nuclei_obj)
 
@@ -233,7 +249,7 @@ def sample_and_optimize(
         num_chains=num_electron_chains,
         num_samples=num_electron_samples,
     )
-    electron_samples = jax.tree.map(lambda x: einops.rearrange(x, "n c s ... -> (n c s) ..."), electron_samples)
+    electron_samples = jax.tree.map(lambda x: einops.rearrange(x, "n c ... -> (n c) ..."), electron_samples)
 
     nuclei_grads = nuclei_energy_grad_hellmann_feynman(wave_function, electron_samples, nuclei, grad_key)
 
