@@ -67,6 +67,14 @@ def _make_system(num_electrons: int, num_nuclei: int, seed: int = 0):
     return Electron(position=e_pos, spin=e_spin), Nucleus(position=n_pos, charge=n_charge)
 
 
+def _neural_system_float64(num_electrons, num_nuclei, seed):
+    wf = WaveFunction(num_electrons=num_electrons, num_nuclei=num_nuclei, rngs=nnx.Rngs(0))
+    nnx.update(wf, jax.tree.map(lambda x: x.astype(jnp.float64), nnx.state(wf)))
+    electrons, nuclei = _make_system(num_electrons, num_nuclei, seed)
+    electrons, nuclei = jax.tree.map(lambda x: x.astype(jnp.float64), (electrons, nuclei))
+    return wf, electrons, nuclei
+
+
 # ---------------------------------------------------------------------------
 # Analytical verification
 # ---------------------------------------------------------------------------
@@ -136,9 +144,10 @@ def test_analytical_correlated_pair_wavefunction(num_electrons: int):
         ("H2O", 10, 3),
     ],
 )
+@jax.enable_x64()
 def test_equivalence_on_wavefunction(name: str, num_electrons: int, num_nuclei: int):
-    wf = WaveFunction(num_electrons=num_electrons, num_nuclei=num_nuclei, rngs=nnx.Rngs(0))
-    electrons, nuclei = _make_system(num_electrons, num_nuclei, seed=42)
+    # Near-singular orbitals amplify float32 differences between contraction orders.
+    wf, electrons, nuclei = _neural_system_float64(num_electrons, num_nuclei, seed=42)
 
     ke_per = calculate_kinetic_energy_per_electron(wf, electrons, nuclei)
     ke_full_0 = calculate_kinetic_energy_full(wf, electrons, nuclei, sparsity_threshold=0)
@@ -164,10 +173,10 @@ def test_invalid_method_raises():
 # ---------------------------------------------------------------------------
 
 
+@jax.enable_x64()
 def test_jit_and_vmap_wavefunction():
     num_electrons, num_nuclei, batch_size = 4, 2, 5
-    wf = WaveFunction(num_electrons=num_electrons, num_nuclei=num_nuclei, rngs=nnx.Rngs(0))
-    electrons_single, nuclei = _make_system(num_electrons, num_nuclei, seed=7)
+    wf, electrons_single, nuclei = _neural_system_float64(num_electrons, num_nuclei, seed=7)
 
     # nnx.jit
     jitted_full = nnx.jit(calculate_kinetic_energy_full)
@@ -176,7 +185,9 @@ def test_jit_and_vmap_wavefunction():
     chex.assert_trees_all_close(ke_jit, ke_eager, rtol=1e-5, atol=1e-5)
 
     # nnx.vmap over batch of electron samples
-    batch_pos = jax.random.normal(jax.random.key(99), (batch_size, num_electrons, 3), dtype=jnp.float32)
+    batch_pos = jax.random.normal(
+        jax.random.key(99), (batch_size, num_electrons, 3), dtype=jnp.float32
+    ).astype(jnp.float64)
     batch_spin = jnp.tile(electrons_single.spin[None, :, :], (batch_size, 1, 1))
     electrons_batch = Electron(position=batch_pos, spin=batch_spin)
 

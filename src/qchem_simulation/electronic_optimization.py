@@ -1,3 +1,5 @@
+import warnings
+
 import jax
 import jax.numpy as jnp
 from dataclasses import dataclass, field
@@ -86,6 +88,7 @@ def calculate_kinetic_energy_full(
     `folx.forward_laplacian` pass over all 3N electron coordinates.
 
     Assumes wave_function returns the log-amplitude log(psi) of the wave function (returns both amplitude and sign).
+    If Folx fails in the sparse Hessian contraction, retry with the exact dense path.
     """
     from folx import forward_laplacian
 
@@ -99,9 +102,28 @@ def calculate_kinetic_energy_full(
         log_amplitude, _sign, _ortho_measure = wf(elec, nuclei)
         return log_amplitude
 
-    laplacian = forward_laplacian(
-        calc_wrt_positions, sparsity_threshold=sparsity_threshold
-    )(flat_positions)
+    try:
+        laplacian = forward_laplacian(
+            calc_wrt_positions, sparsity_threshold=sparsity_threshold
+        )(flat_positions)
+    except IndexError as error:
+        # Folx 0.2.31 can index past the sparse vmap axes in an attention dot product.
+        # Keep unrelated indexing errors visible to the caller.
+        frame = error.__traceback__
+        while frame.tb_next is not None:
+            frame = frame.tb_next
+        if (
+            not sparsity_threshold
+            or frame.tb_frame.f_globals.get("__name__") != "folx.hessian"
+            or frame.tb_frame.f_code.co_name != "vmapped_jac_hessian_jac"
+        ):
+            raise
+        warnings.warn(
+            "Folx could not apply the sparse Hessian contraction. Using the dense forward Laplacian.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        laplacian = forward_laplacian(calc_wrt_positions)(flat_positions)
 
     # Use the identity: (∇^2 psi)/psi = ∇^2 log|psi| + |∇ log|psi||^2
     chex.assert_shape(laplacian.dense_jacobian, (3 * num_electrons,))
