@@ -136,6 +136,8 @@ def main(_args):
             num_electron_samples=num_nuclei_samples,
             num_electron_chains=num_chains,
             key=nuclei_key,
+            gradient_method="hellmann_feynman",
+            max_sample_grad_norm=10.0,
         )
 
         plot_nuclei_and_electrons(
